@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""macclean — TUI dọn dẹp dung lượng cho máy Mac dev (Xcode, Simulator, Gradle, Flutter, cache).
+
+Phím:  ↑↓ / j k   di chuyển          Space   chọn / bỏ chọn (trên tiêu đề nhóm: cả nhóm)
+       Enter ← →  mở / đóng nhóm      s       chọn các mục gợi ý (*)
+       u          bỏ chọn tất cả      c       mở / đóng tất cả nhóm
+       d          xoá mục đã chọn     r       quét lại
+       q          thoát
+
+Tuỳ chọn:  --dry-run   chạy thử, không xoá thật
+           --list      in báo cáo ra terminal rồi thoát (không mở TUI)
+"""
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import locale
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+DATA_VOL = "/System/Volumes/Data" if os.path.exists("/System/Volumes/Data") else "/"
+DAY = 86400
+
+GROUPS = [
+    ("xcode", "Xcode · DeviceSupport & DerivedData",
+     "Symbol debug thiết bị và build tạm — Xcode tự tạo lại khi cần."),
+    ("archive", "Xcode · Archives",
+     "Bản build đã archive (kèm dSYM). Gợi ý: cũ hơn 60 ngày và không phải bản mới nhất của app."),
+    ("sim", "Simulator · thiết bị",
+     "Gợi ý: thiết bị không khả dụng hoặc không mở hơn 90 ngày."),
+    ("runtime", "Simulator · runtime",
+     "Gợi ý: runtime không còn simulator nào, hoặc không dùng hơn 90 ngày."),
+    ("android", "Android · Gradle & emulator",
+     "Xoá cache Gradle thì lần build đầu sau đó sẽ tải lại thư viện. Gợi ý: các bản wrapper cũ."),
+    ("flutter", "Flutter / Dart",
+     "pub-cache (flutter pub get sẽ tải lại) và các bản Flutter của fvm."),
+    ("cache", "Cache ứng dụng",
+     "~/Library/Caches (chỉ hiện mục ≥ 50M) và cache npm. Ứng dụng sẽ tự tạo lại."),
+    ("trash", "Thùng rác", "Nội dung ~/.Trash."),
+]
+GROUP_TITLE = {k: t for k, t, _ in GROUPS}
+GROUP_DESC = {k: d for k, _, d in GROUPS}
+MIN_SHOW = {"cache": 50 << 20, "trash": 1, "xcode": 1}
+SORT_BY_SIZE = {"xcode", "android", "flutter", "cache", "runtime"}
+SAFE_CACHES = {"Homebrew", "CocoaPods", "Yarn", "pip", "node-gyp", "pnpm", "go-build",
+               "com.apple.dt.Xcode", "org.swift.swiftpm", "JetBrains", "Google"}
+
+
+# ───────────────────────────── tiện ích ─────────────────────────────
+
+def run(cmd, timeout=60):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def human(n):
+    if n is None:
+        return "…"
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit in "BK" else f"{n:.1f}{unit}"
+        n /= 1024
+
+
+def du_bytes(path):
+    r = run(["du", "-sk", str(path)], timeout=900)
+    try:
+        return int(r.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return 0
+
+
+def ago(ts):
+    if ts is None:
+        return "chưa dùng"
+    d = int((time.time() - ts) / DAY)
+    return "hôm nay" if d <= 0 else f"{d} ngày trước"
+
+
+def iso_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def mtime(p):
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return None
+
+
+def read_plist(p):
+    try:
+        with open(p, "rb") as f:
+            return plistlib.load(f)
+    except Exception:
+        return {}
+
+
+def dwidth(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def fit(s, w, align="<"):
+    """Cắt / đệm chuỗi theo độ rộng hiển thị trên terminal."""
+    if w <= 0:
+        return ""
+    s = unicodedata.normalize("NFC", str(s))
+    out, cur = [], 0
+    for ch in s:
+        cw = dwidth(ch)
+        if cur + cw > w:
+            while out and cur > w - 1:
+                cur -= dwidth(out.pop())
+            out.append("…")
+            cur += 1
+            break
+        out.append(ch)
+        cur += cw
+    pad = " " * (w - cur)
+    return pad + "".join(out) if align == ">" else "".join(out) + pad
+
+
+def is_safe(p: Path):
+    """Chỉ cho xoá đường dẫn nằm bên trong thư mục home (không phải chính home)."""
+    try:
+        rp = p.parent.resolve() / p.name
+    except OSError:
+        return False
+    return rp != HOME and HOME in rp.parents
+
+
+# ───────────────────────────── dữ liệu ─────────────────────────────
+
+@dataclass
+class Item:
+    group: str
+    label: str
+    target: str                 # đường dẫn, UDID simulator hoặc id runtime
+    kind: str = "path"          # path | contents | sim | runtime
+    detail: str = ""
+    note: str = ""
+    size: int | None = None
+    size_path: str = ""         # đường dẫn để tính dung lượng (nếu khác target)
+    suggested: bool = False
+    selected: bool = False
+    deleted: bool = False
+    error: str = ""
+    extra: dict = field(default_factory=dict)
+
+
+def scan_xcode():
+    items = []
+    base = HOME / "Library/Developer/Xcode"
+    for d in sorted(base.glob("*DeviceSupport/*")):
+        if d.is_dir():
+            plat = d.parent.name.replace(" DeviceSupport", "")
+            items.append(Item("xcode", f"DeviceSupport · {plat} {d.name}", str(d), detail=str(d),
+                              note=ago(mtime(d)), suggested=True))
+    dd = base / "DerivedData"
+    if dd.is_dir():
+        for d in sorted(dd.iterdir()):
+            if d.is_dir():
+                name = re.sub(r"-[a-z]{20,}$", "", d.name)
+                items.append(Item("xcode", f"DerivedData · {name}", str(d), detail=str(d),
+                                  note=ago(mtime(d)), suggested=True))
+    return items
+
+
+def scan_archives():
+    items = []
+    base = HOME / "Library/Developer/Xcode/Archives"
+    if not base.is_dir():
+        return items
+    for arc in base.glob("*/*.xcarchive"):
+        info = read_plist(arc / "Info.plist")
+        app = info.get("ApplicationProperties", {})
+        name = info.get("Name") or arc.stem
+        ver = app.get("CFBundleShortVersionString", "")
+        build = app.get("CFBundleVersion", "")
+        created = info.get("CreationDate")
+        ts = created.replace(tzinfo=timezone.utc).timestamp() if isinstance(created, datetime) else mtime(arc)
+        when = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M") if ts else "?"
+        vb = f" {ver} ({build})" if ver else ""
+        items.append(Item("archive", f"{when} · {name}{vb}", str(arc), detail=str(arc),
+                          note=ago(ts), extra={"ts": ts or 0, "app": name}))
+    items.sort(key=lambda i: i.extra["ts"], reverse=True)
+    newest = {}
+    for it in items:
+        newest.setdefault(it.extra["app"], it)
+    for it in items:
+        it.suggested = it is not newest[it.extra["app"]] and time.time() - it.extra["ts"] > 60 * DAY
+    return items
+
+
+def runtime_name(rid):
+    # com.apple.CoreSimulator.SimRuntime.iOS-26-5 → iOS 26.5
+    tail = rid.rsplit(".", 1)[-1]
+    plat, _, ver = tail.partition("-")
+    return f"{plat} {ver.replace('-', '.')}".strip()
+
+
+def scan_simulators():
+    if not shutil.which("xcrun"):
+        return [], []
+    r = run(["xcrun", "simctl", "list", "devices", "-j"])
+    try:
+        devices = json.loads(r.stdout)["devices"]
+    except (ValueError, KeyError):
+        devices = {}
+    sims, count = [], {}
+    for rid, devs in devices.items():
+        count[rid] = len(devs)
+        for dv in devs:
+            udid = dv["udid"]
+            ddir = Path(dv["dataPath"]).parent if dv.get("dataPath") else \
+                HOME / "Library/Developer/CoreSimulator/Devices" / udid
+            last = iso_ts(dv.get("lastBootedAt"))
+            avail = dv.get("isAvailable", True)
+            note = ago(last) if avail else "không khả dụng"
+            stale = last is not None and time.time() - last > 90 * DAY
+            sims.append(Item("sim", f"{runtime_name(rid)} · {dv['name']}", udid, kind="sim",
+                             detail=f"{udid} · {dv.get('state', '')} · {ddir}", note=note,
+                             size_path=str(ddir), suggested=(not avail) or stale,
+                             extra={"state": dv.get("state")}))
+    sims.sort(key=lambda i: i.label)
+
+    runtimes = []
+    r = run(["xcrun", "simctl", "runtime", "list", "-j"])
+    try:
+        rts = json.loads(r.stdout)
+    except ValueError:
+        rts = {}
+    for rid, rt in rts.items():
+        if not rt.get("deletable", True):
+            continue
+        ident = rt.get("runtimeIdentifier", "")
+        n = count.get(ident, 0)
+        last = iso_ts(rt.get("lastUsedAt"))
+        stale = last is not None and time.time() - last > 90 * DAY
+        label = f"{runtime_name(ident) if ident else rid} ({rt.get('build', '?')})"
+        runtimes.append(Item("runtime", label, rid, kind="runtime", size=rt.get("sizeBytes", 0),
+                             detail=f"{n} simulator · lần dùng cuối: {ago(last)} · {rt.get('path', '')}",
+                             note=f"{n} sim · {ago(last)}", suggested=n == 0 or stale))
+    return sims, runtimes
+
+
+def gradle_version(name):
+    m = re.search(r"gradle-(\d+(?:\.\d+)*)-", name)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def scan_android():
+    items = []
+    g = HOME / ".gradle"
+    for sub, sugg, desc in (("caches", False, "thư viện + build cache, sẽ tải lại khi build"),
+                            ("daemon", True, "log của Gradle daemon")):
+        p = g / sub
+        if p.is_dir():
+            items.append(Item("android", f"Gradle · {sub}", str(p), detail=f"{p} — {desc}",
+                              suggested=sugg, extra={"gradle": True}))
+    dists = g / "wrapper/dists"
+    if dists.is_dir():
+        ds = [d for d in dists.iterdir() if d.is_dir()]
+        vers = [v for v in (gradle_version(d.name) for d in ds) if v]
+        newest = max(vers) if vers else None
+        for d in sorted(ds, key=lambda d: d.name):
+            v = gradle_version(d.name)
+            items.append(Item("android", f"Gradle wrapper · {d.name}", str(d), detail=str(d),
+                              note="mới nhất" if v == newest else ago(mtime(d)),
+                              suggested=v != newest, extra={"gradle": True}))
+    for avd in sorted((HOME / ".android/avd").glob("*.avd")):
+        items.append(Item("android", f"Emulator · {avd.stem}", str(avd), detail=str(avd),
+                          note=ago(mtime(avd))))
+    return items
+
+
+def scan_flutter():
+    items = []
+    pc = HOME / ".pub-cache"
+    if pc.is_dir():
+        items.append(Item("flutter", "pub-cache", str(pc), detail=str(pc)))
+    fvm = HOME / "fvm/versions"
+    if fvm.is_dir():
+        try:
+            default = (HOME / "fvm/default").resolve().name
+        except OSError:
+            default = None
+        for d in sorted(fvm.iterdir()):
+            if d.is_dir():
+                items.append(Item("flutter", f"fvm Flutter {d.name}", str(d), detail=str(d),
+                                  note="default" if d.name == default else ago(mtime(d))))
+    return items
+
+
+def scan_caches():
+    items = []
+    lc = HOME / "Library/Caches"
+    try:
+        children = sorted(lc.iterdir())
+    except OSError:
+        children = []
+    for c in children:
+        if c.is_dir() and not c.is_symlink():
+            items.append(Item("cache", c.name, str(c), detail=str(c), suggested=c.name in SAFE_CACHES))
+    npm = HOME / ".npm/_cacache"
+    if npm.is_dir():
+        items.append(Item("cache", "npm cache", str(npm), detail=str(npm), suggested=True))
+    return items
+
+
+def scan_trash():
+    t = HOME / ".Trash"
+    return [Item("trash", "Thùng rác", str(t), kind="contents", detail=str(t), suggested=True)] \
+        if t.is_dir() else []
+
+
+def scan_all():
+    sims, runtimes = scan_simulators()
+    return scan_xcode() + scan_archives() + sims + runtimes + scan_android() + \
+        scan_flutter() + scan_caches() + scan_trash()
+
+
+def fill_size(it: Item):
+    if it.size is None:
+        it.size = du_bytes(it.size_path or it.target)
+
+
+def visible(it: Item):
+    return it.size is None or it.size >= MIN_SHOW.get(it.group, 0)
+
+
+# ───────────────────────────── xoá ─────────────────────────────
+
+def stop_gradle():
+    run(["pkill", "-f", "GradleDaemon"])
+    run(["pkill", "-f", "KotlinCompileDaemon"])
+
+
+def remove(p: Path, errs: list):
+    if p.is_symlink() or not p.is_dir():
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            errs.append(e)
+    else:
+        shutil.rmtree(p, onerror=lambda _f, _p, exc: errs.append(exc[1]))
+
+
+def delete_item(it: Item):
+    """Trả về None nếu thành công, ngược lại là thông báo lỗi."""
+    try:
+        if it.kind == "sim":
+            if it.extra.get("state") == "Booted":
+                run(["xcrun", "simctl", "shutdown", it.target])
+            r = run(["xcrun", "simctl", "delete", it.target], timeout=180)
+            return None if r.returncode == 0 else (r.stderr.strip() or "simctl delete thất bại")
+        if it.kind == "runtime":
+            r = run(["xcrun", "simctl", "runtime", "delete", it.target], timeout=600)
+            return None if r.returncode == 0 else (r.stderr.strip() or "simctl runtime delete thất bại")
+        p = Path(it.target)
+        if not is_safe(p):
+            return "đường dẫn nằm ngoài thư mục home, bỏ qua"
+        errs = []
+        if it.kind == "contents":
+            for c in p.iterdir():
+                remove(c, errs)
+        else:
+            remove(p, errs)
+            if it.group == "archive":
+                try:
+                    p.parent.rmdir()  # xoá thư mục ngày nếu đã trống
+                except OSError:
+                    pass
+        if errs:
+            return f"{len(errs)} file không xoá được ({errs[0]})"
+        return None
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
+# ───────────────────────────── thông tin hệ thống ─────────────────────────────
+
+class SysInfo:
+    def __init__(self):
+        self.parts = [("Đang đọc thông tin hệ thống…", False)]
+
+    def refresh_async(self):
+        threading.Thread(target=self.refresh, daemon=True).start()
+
+    def refresh(self):
+        parts = []
+        du = shutil.disk_usage(DATA_VOL)
+        pct = du.used / (du.used + du.free) if du.used + du.free else 0
+        parts.append((f"Ổ đĩa: {human(du.free)} trống ({pct:.0%} đã dùng)", pct > 0.9))
+        m = re.search(r"total = ([\d.,]+)M\s+used = ([\d.,]+)M", run(["sysctl", "-n", "vm.swapusage"]).stdout)
+        if m:
+            total, used = (float(x.replace(",", ".")) for x in m.groups())
+            parts.append((f"Swap: {used / 1024:.1f}/{total / 1024:.1f}G", total > 0 and used / total > 0.8))
+        batt = re.search(r"(\d+)%", run(["pmset", "-g", "batt"]).stdout)
+        if batt:
+            sp = run(["system_profiler", "SPPowerDataType"], timeout=30).stdout
+            cyc = re.search(r"Cycle Count:\s*(\d+)", sp)
+            cond = re.search(r"Condition:\s*(.+)", sp)
+            cond = cond.group(1).strip() if cond else ""
+            txt = f"Pin: {batt.group(1)}%" + (f", {cyc.group(1)} chu kỳ" if cyc else "") + (f", {cond}" if cond else "")
+            parts.append((txt, bool(cond) and cond != "Normal"))
+        sip = run(["csrutil", "status"]).stdout
+        if sip:
+            on = "enabled" in sip
+            parts.append(("SIP: bật" if on else "SIP: TẮT", not on))
+        self.parts = parts
+
+    def free(self):
+        return shutil.disk_usage(DATA_VOL).free
+
+
+# ───────────────────────────── TUI ─────────────────────────────
+
+C_SUGG, C_BIG, C_WARN, C_SEL, C_DIM, C_HEAD = range(1, 7)
+
+
+class App:
+    def __init__(self, scr, dry_run=False):
+        self.scr = scr
+        self.dry = dry_run
+        self.items: list[Item] = []
+        self.collapsed: set[str] = set()
+        self.cur = 0
+        self.top = 0
+        self.msg = ""
+        self.msg_warn = False
+        self.scanning = False
+        self.spin = 0
+        self.sys = SysInfo()
+        self.pool = ThreadPoolExecutor(max_workers=4)
+
+    # ── quét ──
+    def start_scan(self):
+        if self.scanning:
+            return
+        self.scanning = True
+        self.items = []
+        self.cur = self.top = 0
+        self.set_msg("Đang quét…")
+        self.sys.refresh_async()
+        threading.Thread(target=self._scan, daemon=True).start()
+
+    def _scan(self):
+        try:
+            items = scan_all()
+            self.items = items
+            for f in [self.pool.submit(fill_size, it) for it in items if it.size is None]:
+                f.result()
+            self.set_msg("")
+        except Exception as e:  # noqa: BLE001
+            self.set_msg(f"Lỗi khi quét: {e}", warn=True)
+        finally:
+            self.scanning = False
+
+    def set_msg(self, text, warn=False):
+        self.msg, self.msg_warn = text, warn
+
+    # ── danh sách hàng hiển thị ──
+    def rows(self):
+        out = []
+        for key, _, _ in GROUPS:
+            its = [i for i in self.items if i.group == key and not i.deleted and visible(i)]
+            if not its:
+                continue
+            out.append(("h", key, its))
+            if key in self.collapsed:
+                continue
+            if key in SORT_BY_SIZE and all(i.size is not None for i in its):
+                its = sorted(its, key=lambda i: i.size, reverse=True)
+            out.extend(("i", i, None) for i in its)
+        return out
+
+    def pending(self):
+        return sum(1 for i in self.items if i.size is None)
+
+    # ── vẽ ──
+    def put(self, y, x, s, attr=0):
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 12 or w < 60:
+            self.put(0, 0, fit("Cửa sổ quá nhỏ — hãy phóng to terminal (tối thiểu 60×12).", w - 1))
+            scr.refresh()
+            return
+
+        # tiêu đề
+        busy = self.scanning or self.pending()
+        self.spin = (self.spin + 1) % 4
+        title = " macclean — dọn dẹp dung lượng Mac "
+        if self.dry:
+            title += "[DRY-RUN] "
+        if busy:
+            title += "|/-\\"[self.spin] + f" đang tính dung lượng ({self.pending()} mục)"
+        self.put(0, 0, fit(title, w), curses.A_BOLD | curses.color_pair(C_HEAD))
+
+        # thông tin hệ thống
+        x = 1
+        for n, (txt, warn) in enumerate(self.sys.parts):
+            if n:
+                self.put(1, x, " │ ", curses.color_pair(C_DIM))
+                x += 3
+            seg = fit(txt, max(0, w - x - 1)).rstrip()
+            self.put(1, x, seg, curses.color_pair(C_WARN) | curses.A_BOLD if warn else 0)
+            x += len(seg)
+        self.put(2, 0, "─" * (w - 1), curses.color_pair(C_DIM))
+
+        # danh sách
+        rows = self.rows()
+        H = h - 6
+        self.cur = max(0, min(self.cur, len(rows) - 1))
+        if self.cur < self.top:
+            self.top = self.cur
+        elif self.cur >= self.top + H:
+            self.top = self.cur - H + 1
+        self.top = max(0, min(self.top, max(0, len(rows) - H)))
+
+        if not rows:
+            self.put(4, 2, "Đang quét…" if self.scanning else "Không tìm thấy gì để dọn. 🎉")
+
+        nw = min(20, max(0, w - 64))
+        lw = w - 8 - 1 - 8 - 2 - nw - 1
+        for idx in range(self.top, min(len(rows), self.top + H)):
+            y = 3 + idx - self.top
+            kind, obj, its = rows[idx]
+            cursor = curses.A_REVERSE if idx == self.cur else 0
+            if kind == "h":
+                total = sum(i.size or 0 for i in its)
+                nsel = sum(1 for i in its if i.selected)
+                arrow = "▸" if obj in self.collapsed else "▾"
+                right = f"{len(its)} mục · {human(total)}" + (f" · đã chọn {nsel}" if nsel else "")
+                left = f"{arrow} {GROUP_TITLE[obj]}"
+                line = fit(left, w - 2 - len(right) - 1) + right + " "
+                self.put(y, 0, line, curses.A_BOLD | curses.color_pair(C_HEAD) | cursor)
+            else:
+                it = obj
+                mark = "[x]" if it.selected else "[ ]"
+                star = "*" if it.suggested else " "
+                big = it.size is not None and it.size >= 1 << 30
+                label_attr = curses.color_pair(C_SEL) | curses.A_BOLD if it.selected else 0
+                if it.error:
+                    label_attr = curses.color_pair(C_WARN)
+                self.put(y, 0, "  " + mark + " ", cursor | (curses.color_pair(C_SEL) if it.selected else 0))
+                self.put(y, 6, star + " ", cursor | curses.color_pair(C_SUGG) | curses.A_BOLD)
+                self.put(y, 8, fit(it.label, lw) + " ", cursor | label_attr)
+                self.put(y, 8 + lw + 1, fit(human(it.size), 8, ">"),
+                         cursor | (curses.color_pair(C_BIG) | curses.A_BOLD if big else 0))
+                note = "LỖI" if it.error else it.note
+                self.put(y, 8 + lw + 9, "  " + fit(note, nw) + " ", cursor | curses.color_pair(C_DIM))
+
+        # thanh dưới
+        self.put(h - 3, 0, "─" * (w - 1), curses.color_pair(C_DIM))
+        if self.msg:
+            self.put(h - 2, 1, fit(self.msg, w - 2),
+                     curses.color_pair(C_WARN if self.msg_warn else C_SUGG) | curses.A_BOLD)
+        elif rows:
+            kind, obj, _ = rows[self.cur]
+            text = GROUP_DESC[obj] if kind == "h" else (f"Lỗi: {obj.error}" if obj.error else obj.detail)
+            self.put(h - 2, 1, fit(text, w - 2), curses.color_pair(C_DIM))
+        sel = [i for i in self.items if i.selected and not i.deleted]
+        left = f" Đã chọn {len(sel)} mục · {human(sum(i.size or 0 for i in sel))} "
+        keys = " Space chọn  Enter mở/đóng  s gợi ý  u bỏ chọn  d xoá  r quét lại  q thoát"
+        self.put(h - 1, 0, left, curses.A_REVERSE | curses.A_BOLD)
+        self.put(h - 1, len(left), fit(keys, w - len(left) - 1), curses.color_pair(C_DIM))
+        scr.refresh()
+
+    # ── hộp thoại xác nhận ──
+    def confirm(self, sel):
+        h, w = self.scr.getmaxyx()
+        total = sum(i.size or 0 for i in sel)
+        bw = min(w - 4, 76)
+        maxn = max(1, min(len(sel), h - 12))
+        lines = [f"Xoá {len(sel)} mục, khoảng {human(total)}?", ""]
+        lines += [f" • {fit(i.label, bw - 16)} {fit(human(i.size), 8, '>')}" for i in sel[:maxn]]
+        if len(sel) > maxn:
+            lines.append(f"   … và {len(sel) - maxn} mục khác")
+        lines += ["", "(DRY-RUN: không xoá thật)" if self.dry else "Thao tác này KHÔNG hoàn tác được.",
+                  "Nhấn  y  để xoá, phím bất kỳ để huỷ."]
+        bh = len(lines) + 2
+        win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+        win.bkgd(" ", curses.color_pair(0))
+        win.erase()
+        win.attron(curses.color_pair(C_WARN))
+        win.border()
+        win.attroff(curses.color_pair(C_WARN))
+        for n, line in enumerate(lines):
+            attr = curses.A_BOLD if n == 0 or n >= len(lines) - 2 else 0
+            try:
+                win.addstr(1 + n, 2, fit(line, bw - 4), attr)
+            except curses.error:
+                pass
+        win.refresh()
+        self.scr.timeout(-1)
+        try:
+            k = self.scr.get_wch()
+        except curses.error:
+            k = None
+        finally:
+            self.scr.timeout(250)
+        return k in ("y", "Y")
+
+    # ── xoá ──
+    def delete_selected(self):
+        sel = [i for i in self.items if i.selected and not i.deleted]
+        if not sel:
+            self.set_msg("Chưa chọn mục nào (Space để chọn, s để chọn các mục gợi ý).", warn=True)
+            return
+        if self.scanning:
+            self.set_msg("Đang quét, đợi quét xong rồi xoá nhé.", warn=True)
+            return
+        if not self.confirm(sel):
+            self.set_msg("Đã huỷ.")
+            return
+        if self.dry:
+            for i in sel:
+                i.selected = False
+            self.set_msg(f"DRY-RUN: sẽ xoá {len(sel)} mục, khoảng {human(sum(i.size or 0 for i in sel))}.")
+            return
+        before = self.sys.free()
+        gradle_stopped = False
+        ok = fail = 0
+        for n, it in enumerate(sel, 1):
+            self.set_msg(f"[{n}/{len(sel)}] Đang xoá: {it.label} ({human(it.size)})…")
+            self.draw()
+            if it.extra.get("gradle") and not gradle_stopped:
+                stop_gradle()
+                gradle_stopped = True
+            err = delete_item(it)
+            it.selected = False
+            if err:
+                it.error = err
+                fail += 1
+            else:
+                it.deleted = True
+                ok += 1
+        self.items = [i for i in self.items if not i.deleted]
+        freed = max(0, self.sys.free() - before)
+        self.sys.refresh_async()
+        msg = f"Đã xoá {ok} mục, giải phóng khoảng {human(freed)}."
+        if fail:
+            msg += f" {fail} mục lỗi (tô đỏ, đưa con trỏ vào để xem chi tiết)."
+        self.set_msg(msg, warn=bool(fail))
+
+    # ── xử lý phím ──
+    def handle(self, k):
+        rows = self.rows()
+        H = max(1, self.scr.getmaxyx()[0] - 6)
+        cur = rows[self.cur] if rows and self.cur < len(rows) else None
+        if k not in (curses.KEY_RESIZE,):
+            if not self.scanning and not self.msg.startswith("["):
+                self.msg = ""
+
+        if k in ("q", "Q"):
+            return False
+        elif k in (curses.KEY_UP, "k"):
+            self.cur -= 1
+        elif k in (curses.KEY_DOWN, "j"):
+            self.cur += 1
+        elif k == curses.KEY_PPAGE:
+            self.cur -= H
+        elif k == curses.KEY_NPAGE:
+            self.cur += H
+        elif k in (curses.KEY_HOME, "g"):
+            self.cur = 0
+        elif k in (curses.KEY_END, "G"):
+            self.cur = len(rows) - 1
+        elif k == " " and cur:
+            kind, obj, its = cur
+            if kind == "h":
+                state = not all(i.selected for i in its)
+                for i in its:
+                    i.selected = state
+            else:
+                obj.selected = not obj.selected
+                self.cur += 1
+        elif k in ("\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT, curses.KEY_LEFT, "l", "h") and cur:
+            kind, obj, _ = cur
+            key = obj if kind == "h" else obj.group
+            if k in (curses.KEY_RIGHT, "l"):
+                self.collapsed.discard(key)
+            elif k in (curses.KEY_LEFT, "h") or key not in self.collapsed:
+                self.collapsed.add(key)
+                self.cur = next(n for n, r in enumerate(self.rows()) if r[0] == "h" and r[1] == key)
+            else:
+                self.collapsed.discard(key)
+        elif k == "c":
+            keys = {i.group for i in self.items}
+            self.collapsed = set() if self.collapsed >= keys else keys
+        elif k == "s":
+            n = 0
+            for i in self.items:
+                if i.suggested and visible(i) and not i.deleted:
+                    n += not i.selected
+                    i.selected = True
+            self.set_msg(f"Đã chọn thêm {n} mục gợi ý (*)." if n else "Không có mục gợi ý nào chưa chọn.")
+        elif k == "u":
+            for i in self.items:
+                i.selected = False
+        elif k in ("d", "D", "x", curses.KEY_DC):
+            self.delete_selected()
+        elif k in ("r", "R"):
+            self.start_scan()
+        return True
+
+    def loop(self):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for pair, fg in ((C_SUGG, curses.COLOR_GREEN), (C_BIG, curses.COLOR_YELLOW),
+                         (C_WARN, curses.COLOR_RED), (C_SEL, curses.COLOR_CYAN),
+                         (C_DIM, 8 if curses.COLORS > 8 else curses.COLOR_WHITE),
+                         (C_HEAD, curses.COLOR_BLUE)):
+            curses.init_pair(pair, fg, -1)
+        self.scr.keypad(True)
+        self.scr.timeout(250)
+        self.start_scan()
+        while True:
+            self.draw()
+            try:
+                k = self.scr.get_wch()
+            except curses.error:
+                continue
+            if self.handle(k) is False:
+                break
+
+
+# ───────────────────────────── chế độ báo cáo ─────────────────────────────
+
+def report():
+    print("Đang quét…", file=sys.stderr)
+    items = scan_all()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(fill_size, items))
+    sinfo = SysInfo()
+    sinfo.refresh()
+    print(" │ ".join(t for t, _ in sinfo.parts))
+    grand = sugg_total = 0
+    for key, title, _ in GROUPS:
+        its = [i for i in items if i.group == key and visible(i)]
+        if not its:
+            continue
+        if key in SORT_BY_SIZE:
+            its.sort(key=lambda i: i.size or 0, reverse=True)
+        total = sum(i.size or 0 for i in its)
+        grand += total
+        print(f"\n▾ {title}  —  {len(its)} mục · {human(total)}")
+        for i in its:
+            sugg_total += (i.size or 0) if i.suggested else 0
+            print(f"  {'*' if i.suggested else ' '} {fit(i.label, 56)} {fit(human(i.size), 8, '>')}  {i.note}")
+    print(f"\nTổng: {human(grand)} · Gợi ý (*) có thể xoá: {human(sugg_total)}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="macclean", description="TUI dọn dẹp dung lượng cho máy Mac dev.")
+    ap.add_argument("--dry-run", action="store_true", help="chạy thử, không xoá thật")
+    ap.add_argument("--list", action="store_true", help="in báo cáo rồi thoát (không mở TUI)")
+    args = ap.parse_args()
+    if sys.platform != "darwin":
+        sys.exit("macclean chỉ chạy trên macOS.")
+    if args.list:
+        return report()
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(lambda scr: App(scr, args.dry_run).loop())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
