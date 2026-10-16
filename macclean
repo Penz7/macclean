@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """macclean — TUI dọn dẹp dung lượng cho máy Mac dev (Xcode, Simulator, Gradle, Flutter, cache).
 
-Phím:  ↑↓ / j k   di chuyển          Space   chọn / bỏ chọn (trên tiêu đề nhóm: cả nhóm)
+Phím:  f          DỌN NHANH: chọn mọi mục gợi ý (*) rồi hỏi xác nhận xoá
+       ↑↓ / j k   di chuyển          Space   chọn / bỏ chọn (trên tiêu đề nhóm: cả nhóm)
+       a          chọn cả nhóm hiện tại
        Enter ← →  mở / đóng nhóm      s       chọn các mục gợi ý (*)
        u          bỏ chọn tất cả      c       mở / đóng tất cả nhóm
        d          xoá mục đã chọn     r       quét lại
@@ -9,6 +11,7 @@ Phím:  ↑↓ / j k   di chuyển          Space   chọn / bỏ chọn (trên 
 
 Tuỳ chọn:  --dry-run   chạy thử, không xoá thật
            --list      in báo cáo ra terminal rồi thoát (không mở TUI)
+           --quick     dọn nhanh các mục gợi ý không cần TUI (thêm --yes để bỏ qua câu hỏi)
 """
 from __future__ import annotations
 
@@ -368,6 +371,28 @@ def remove(p: Path, errs: list):
         shutil.rmtree(p, onerror=lambda _f, _p, exc: errs.append(exc[1]))
 
 
+def delete_items(items, progress=None):
+    """Xoá lần lượt; trả về (số thành công, số lỗi, dung lượng đã giải phóng)."""
+    before = shutil.disk_usage(DATA_VOL).free
+    gradle_stopped = False
+    ok = fail = 0
+    for n, it in enumerate(items, 1):
+        if progress:
+            progress(n, len(items), it)
+        if it.extra.get("gradle") and not gradle_stopped:
+            stop_gradle()
+            gradle_stopped = True
+        err = delete_item(it)
+        it.selected = False
+        if err:
+            it.error = err
+            fail += 1
+        else:
+            it.deleted = True
+            ok += 1
+    return ok, fail, max(0, shutil.disk_usage(DATA_VOL).free - before)
+
+
 def delete_item(it: Item):
     """Trả về None nếu thành công, ngược lại là thông báo lỗi."""
     try:
@@ -473,7 +498,12 @@ class App:
             self.items = items
             for f in [self.pool.submit(fill_size, it) for it in items if it.size is None]:
                 f.result()
-            self.set_msg("")
+            sugg = [i for i in items if i.suggested and visible(i)]
+            if sugg:
+                self.set_msg(f"Quét xong. Có {len(sugg)} mục gợi ý (*) · {human(sum(i.size or 0 for i in sugg))}"
+                             " — nhấn f để dọn nhanh.")
+            else:
+                self.set_msg("Quét xong. Không có mục gợi ý nào — máy đang gọn gàng.")
         except Exception as e:  # noqa: BLE001
             self.set_msg(f"Lỗi khi quét: {e}", warn=True)
         finally:
@@ -591,9 +621,12 @@ class App:
             self.put(h - 2, 1, fit(text, w - 2), curses.color_pair(C_DIM))
         sel = [i for i in self.items if i.selected and not i.deleted]
         left = f" Đã chọn {len(sel)} mục · {human(sum(i.size or 0 for i in sel))} "
-        keys = " Space chọn  Enter mở/đóng  s gợi ý  u bỏ chọn  d xoá  r quét lại  q thoát"
+        fast = " f dọn nhanh "
+        keys = " Space chọn  a cả nhóm  s gợi ý  u bỏ chọn  d xoá  Enter mở/đóng  r quét lại  q thoát"
         self.put(h - 1, 0, left, curses.A_REVERSE | curses.A_BOLD)
-        self.put(h - 1, len(left), fit(keys, w - len(left) - 1), curses.color_pair(C_DIM))
+        self.put(h - 1, len(left) + 1, fast, curses.A_REVERSE | curses.A_BOLD | curses.color_pair(C_SUGG))
+        x = len(left) + 1 + len(fast)
+        self.put(h - 1, x, fit(keys, w - x - 1), curses.color_pair(C_DIM))
         scr.refresh()
 
     # ── hộp thoại xác nhận ──
@@ -648,25 +681,12 @@ class App:
                 i.selected = False
             self.set_msg(f"DRY-RUN: sẽ xoá {len(sel)} mục, khoảng {human(sum(i.size or 0 for i in sel))}.")
             return
-        before = self.sys.free()
-        gradle_stopped = False
-        ok = fail = 0
-        for n, it in enumerate(sel, 1):
-            self.set_msg(f"[{n}/{len(sel)}] Đang xoá: {it.label} ({human(it.size)})…")
+        def progress(n, total, it):
+            self.set_msg(f"[{n}/{total}] Đang xoá: {it.label} ({human(it.size)})…")
             self.draw()
-            if it.extra.get("gradle") and not gradle_stopped:
-                stop_gradle()
-                gradle_stopped = True
-            err = delete_item(it)
-            it.selected = False
-            if err:
-                it.error = err
-                fail += 1
-            else:
-                it.deleted = True
-                ok += 1
+
+        ok, fail, freed = delete_items(sel, progress)
         self.items = [i for i in self.items if not i.deleted]
-        freed = max(0, self.sys.free() - before)
         self.sys.refresh_async()
         msg = f"Đã xoá {ok} mục, giải phóng khoảng {human(freed)}."
         if fail:
@@ -715,6 +735,23 @@ class App:
                 self.cur = next(n for n, r in enumerate(self.rows()) if r[0] == "h" and r[1] == key)
             else:
                 self.collapsed.discard(key)
+        elif k == "a" and cur:
+            kind, obj, _ = cur
+            key = obj if kind == "h" else obj.group
+            its = [i for i in self.items if i.group == key and not i.deleted and visible(i)]
+            state = not all(i.selected for i in its)
+            for i in its:
+                i.selected = state
+        elif k == "f":
+            if self.scanning:
+                self.set_msg("Đang quét, đợi quét xong rồi dọn nhanh nhé.", warn=True)
+            elif not any(i.suggested and visible(i) and not i.deleted for i in self.items):
+                self.set_msg("Không có mục gợi ý nào để dọn nhanh.")
+            else:
+                for i in self.items:
+                    if i.suggested and visible(i) and not i.deleted:
+                        i.selected = True
+                self.delete_selected()
         elif k == "c":
             keys = {i.group for i in self.items}
             self.collapsed = set() if self.collapsed >= keys else keys
@@ -757,11 +794,49 @@ class App:
 
 # ───────────────────────────── chế độ báo cáo ─────────────────────────────
 
-def report():
+def scan_sized():
     print("Đang quét…", file=sys.stderr)
     items = scan_all()
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(fill_size, items))
+    return items
+
+
+def quick(dry_run=False, yes=False):
+    """Dọn nhanh các mục gợi ý (*) không cần mở TUI."""
+    sel = [i for i in scan_sized() if i.suggested and visible(i)]
+    if not sel:
+        print("Không có mục gợi ý nào để dọn — máy đang gọn gàng.")
+        return
+    total = sum(i.size or 0 for i in sel)
+    for key, title, _ in GROUPS:
+        its = [i for i in sel if i.group == key]
+        if its:
+            print(f"\n▾ {title}  —  {len(its)} mục · {human(sum(i.size or 0 for i in its))}")
+            for i in its:
+                print(f"    {fit(i.label, 58)} {fit(human(i.size), 8, '>')}")
+    print(f"\nDọn nhanh: {len(sel)} mục · khoảng {human(total)}")
+    if dry_run:
+        print("DRY-RUN: không xoá gì.")
+        return
+    if not yes:
+        try:
+            ans = input("Xoá các mục trên? Thao tác này không hoàn tác được. [y/N] ")
+        except EOFError:
+            ans = ""
+        if ans.strip().lower() not in ("y", "yes", "c", "có"):
+            print("Đã huỷ.")
+            return
+    ok, fail, freed = delete_items(
+        sel, lambda n, t, it: print(f"[{n}/{t}] Đang xoá: {it.label} ({human(it.size)})", flush=True))
+    for i in sel:
+        if i.error:
+            print(f"  LỖI · {i.label}: {i.error}", file=sys.stderr)
+    print(f"\nĐã xoá {ok} mục, giải phóng khoảng {human(freed)}." + (f" {fail} mục lỗi." if fail else ""))
+
+
+def report():
+    items = scan_sized()
     sinfo = SysInfo()
     sinfo.refresh()
     print(" │ ".join(t for t, _ in sinfo.parts))
@@ -785,11 +860,17 @@ def main():
     ap = argparse.ArgumentParser(prog="macclean", description="TUI dọn dẹp dung lượng cho máy Mac dev.")
     ap.add_argument("--dry-run", action="store_true", help="chạy thử, không xoá thật")
     ap.add_argument("--list", action="store_true", help="in báo cáo rồi thoát (không mở TUI)")
+    ap.add_argument("--quick", action="store_true", help="dọn nhanh các mục gợi ý (*) không cần TUI")
+    ap.add_argument("-y", "--yes", action="store_true", help="dùng với --quick: không hỏi xác nhận")
     args = ap.parse_args()
+    if args.yes and not args.quick:
+        ap.error("--yes chỉ dùng cùng --quick")
     if sys.platform != "darwin":
         sys.exit("macclean chỉ chạy trên macOS.")
     if args.list:
         return report()
+    if args.quick:
+        return quick(args.dry_run, args.yes)
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
     try:

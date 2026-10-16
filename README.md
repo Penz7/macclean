@@ -15,7 +15,7 @@ Tool TUI chạy trong terminal để **kiểm tra và dọn dung lượng** trê
   [ ] * iOS 18.4 (22E238)                                      7.8G  0 sim · 210 ngày trước
 ▸ Android · Gradle & emulator                                           4 mục · 31.4G
 ────────────────────────────────────────────────────────────────────────────────────
- Đã chọn 2 mục · 624.0M   Space chọn  Enter mở/đóng  s gợi ý  u bỏ chọn  d xoá  q thoát
+ Đã chọn 2 mục · 624.0M  f dọn nhanh  Space chọn  a cả nhóm  s gợi ý  d xoá  q thoát
 ```
 
 ## Cài đặt nhanh
@@ -50,15 +50,26 @@ mkdir -p ~/.local/bin && gh api repos/Penz7/macclean/contents/macclean \
 ## Sử dụng
 
 ```bash
-macclean            # mở giao diện TUI
-macclean --dry-run  # chạy thử, không xoá thật
-macclean --list     # in báo cáo ra terminal rồi thoát
+macclean                  # mở giao diện TUI
+macclean --dry-run        # chạy thử, không xoá thật
+macclean --list           # in báo cáo ra terminal rồi thoát
+macclean --quick          # dọn nhanh các mục gợi ý, không mở TUI (có hỏi y/N)
+macclean --quick --yes    # dọn nhanh, không hỏi lại (dùng cho script / cron)
 ```
+
+### ⚡ Dọn nhanh
+
+Không cần tick từng mục: mở `macclean`, đợi quét xong, nhấn **`f`** rồi **`y`**. Toàn bộ mục được gợi ý `*` sẽ bị xoá.
+Muốn xem trước những gì sẽ bị xoá thì chạy `macclean --quick --dry-run`.
+
+### Phím tắt
 
 | Phím | Tác dụng |
 |---|---|
+| **`f`** | **dọn nhanh**: chọn mọi mục gợi ý `*` rồi hỏi xác nhận xoá |
 | `↑` `↓` / `j` `k` | di chuyển (`PgUp` `PgDn`, `g` `G` để nhảy) |
 | `Space` | chọn / bỏ chọn; trên tiêu đề nhóm thì chọn cả nhóm |
+| `a` | chọn / bỏ chọn cả nhóm đang đứng |
 | `Enter` / `←` `→` | mở / đóng nhóm (`c` để mở / đóng tất cả) |
 | `s` | chọn các mục được gợi ý (`*`) |
 | `u` | bỏ chọn tất cả |
