@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""macclean — TUI dọn dẹp dung lượng cho máy Mac dev (Xcode, Simulator, Gradle, Flutter, cache).
+"""macclean — TUI dọn dẹp dung lượng cho máy Mac dev (Xcode, Simulator, Gradle, Flutter, cache),
+kèm tab Khởi động & hiệu năng: xem vì sao máy lag, tắt / bật lại dịch vụ tự chạy.
 
-Phím:  f          DỌN NHANH: chọn mọi mục gợi ý (*) rồi hỏi xác nhận xoá
+Phím:  f          DỌN NHANH: chọn mọi mục gợi ý (*) rồi hỏi xác nhận xoá (tab 2: tắt nhanh)
        ↑↓ / j k   di chuyển          Space   chọn / bỏ chọn (trên tiêu đề nhóm: cả nhóm)
        a          chọn cả nhóm hiện tại
        Enter ← →  mở / đóng nhóm      s       chọn các mục gợi ý (*)
        u          bỏ chọn tất cả      c       mở / đóng tất cả nhóm
-       d          xoá mục đã chọn     r       quét lại
+       d          xoá mục đã chọn     r       quét lại   (tab 2: d tắt, e bật lại)
+       i          xem chi tiết        Tab 1 2 chuyển tab Dung lượng / Khởi động & hiệu năng
        q          thoát
 
-Tuỳ chọn:  --dry-run   chạy thử, không xoá thật
+Tuỳ chọn:  --dry-run   chạy thử, không xoá / tắt thật
            --list      in báo cáo ra terminal rồi thoát (không mở TUI)
            --quick     dọn nhanh các mục gợi ý không cần TUI (thêm --yes để bỏ qua câu hỏi)
+           --startup   in báo cáo khởi động & hiệu năng (kèm lệnh mở lại) rồi thoát
 """
 from __future__ import annotations
 
@@ -22,10 +25,12 @@ import locale
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import unicodedata
@@ -59,8 +64,21 @@ GROUPS = [
      "~/Library/Caches (chỉ hiện mục ≥ 50M) và cache npm. Ứng dụng sẽ tự tạo lại."),
     ("trash", "Thùng rác", "Nội dung ~/.Trash."),
 ]
-GROUP_TITLE = {k: t for k, t, _ in GROUPS}
-GROUP_DESC = {k: d for k, _, d in GROUPS}
+STARTUP_GROUPS = [
+    ("perf", "Hiệu năng · vì sao máy chậm",
+     "Chẩn đoán swap, tải CPU, nhiệt độ và các app đang tốn RAM/CPU — chỉ để xem, macclean không tự tắt app."),
+    ("brew", "Homebrew services",
+     "Database / dịch vụ dev chạy nền suốt. Gợi ý: tắt, khi cần thì brew services start <tên>."),
+    ("login", "Mở khi đăng nhập",
+     "Login Items (Cài đặt → Chung → Mục đăng nhập) và tuỳ chọn tự mở của Docker Desktop."),
+    ("agent", "LaunchAgents · tự chạy theo người dùng",
+     "~/Library/LaunchAgents và /Library/LaunchAgents. Gợi ý: mục hỏng và trình tự cập nhật."),
+    ("daemon", "LaunchDaemons · dịch vụ hệ thống",
+     "/Library/LaunchDaemons — chạy bằng root, tắt / bật cần mật khẩu admin."),
+]
+STARTUP_KEYS = {k for k, _, _ in STARTUP_GROUPS}
+GROUP_TITLE = {k: t for k, t, _ in GROUPS + STARTUP_GROUPS}
+GROUP_DESC = {k: d for k, _, d in GROUPS + STARTUP_GROUPS}
 MIN_SHOW = {"cache": 50 << 20, "trash": 1, "xcode": 1, "ai": 1 << 20, "ai_models": 1 << 20}
 SORT_BY_SIZE = {"xcode", "android", "flutter", "cache", "runtime", "ai", "ai_models"}
 SAFE_CACHES = {"Homebrew", "CocoaPods", "Yarn", "pip", "node-gyp", "pnpm", "go-build",
@@ -172,7 +190,7 @@ class Item:
     group: str
     label: str
     target: str                 # đường dẫn, UDID simulator hoặc id runtime
-    kind: str = "path"          # path | contents | sim | runtime
+    kind: str = "path"          # path | contents | sim | runtime | paths | info | launchd | brew | login | docker
     detail: str = ""
     note: str = ""
     size: int | None = None
@@ -587,6 +605,513 @@ def delete_item(it: Item):
         return str(e)
 
 
+# ───────────────────────────── khởi động & hiệu năng ─────────────────────────────
+
+UID = os.getuid()
+STATE_DIR = HOME / ".local/state/macclean"
+STATE_FILE = STATE_DIR / "disabled.json"      # các mục macclean đã tắt + cách bật lại
+BACKUP_DIR = STATE_DIR / "launchd-backup"     # plist hỏng được cất vào đây thay vì xoá
+ACTION_KINDS = {"launchd", "brew", "login", "docker"}
+GIB = 1 << 30
+
+UPDATER_RE = re.compile(r"update|keystone|shipit|syncreporter", re.I)
+BROWSER_RE = re.compile(r"google|chrome|firefox|mozilla|brave|edgeupdater|microsoft\.edge|opera", re.I)
+KEEP_RULES = [(re.compile(rx, re.I), why) for rx, why in (
+    (r"docker", "Dịch vụ phụ của Docker Desktop — rất nhẹ, chỉ hoạt động khi bạn mở Docker."),
+    (r"vpn|warp|wireguard|tunnel", "VPN / mạng — tắt thì VPN không tự kết nối nữa."),
+    (r"licens", "Kiểm tra bản quyền — tắt có thể khiến ứng dụng (vd Office) báo lỗi bản quyền."),
+    (r"falcon|crowdstrike|sentinel|jamf|kandji|mdm|zscaler|intune",
+     "Bảo mật / quản lý máy của công ty — không nên tắt."),
+)]
+DEV_SERVICE_RE = re.compile(r"mysql|mariadb|postgres|mongo|redis|valkey|memcache|elasticsearch|opensearch|"
+                            r"rabbitmq|kafka|zookeeper|minio|nginx|httpd|php|mosquitto|influx|clickhouse|"
+                            r"cassandra|neo4j|couchdb|grafana|prometheus|jenkins", re.I)
+INTERPRETERS = {"node", "python", "ruby", "perl", "sh", "bash", "zsh", "osascript", "java", "deno", "bun"}
+
+# (regex trên đường dẫn tiến trình, tên nhóm — None: lấy tên app, lời khuyên)
+PROC_RULES = [(re.compile(rx), name, tip) for rx, name, tip in (
+    (r"StorageManagementService|ApplicationsStorageExtension", "Cài đặt · Dung lượng",
+     "Cài đặt hệ thống → Dung lượng đang tính toán — đóng Cài đặt hệ thống khi xem xong."),
+    (r"/(mds|mds_stores|mdworker[^/]*)$", "Spotlight",
+     "Spotlight đang lập chỉ mục lại (hay gặp sau khi xoá / chép nhiều file) — đợi nó tự xong."),
+    (r"gen_snapshot|dartvm|/dart$|/flutter", "Flutter / Dart",
+     "Flutter đang build hoặc analysis server của IDE — tránh build song song nhiều project."),
+    (r"/kernel_task$", "kernel_task", "macOS chiếm CPU để hạ nhiệt — máy đang nóng, kê cho thoáng và giảm tải."),
+    (r"/WindowServer$", "WindowServer",
+     "Vẽ giao diện — tăng khi máy quá tải, nhiều cửa sổ hoặc nhiều màn hình."),
+    (r"/java$|Gradle|Kotlin", "Java / Gradle", "Gradle / Kotlin daemon — chạy ./gradlew --stop khi không build Android."),
+    (r"Docker|com\.docker|qemu|Virtualization\.VirtualMachine", "Docker / máy ảo",
+     "Máy ảo Docker giữ RAM cố định — Quit Docker Desktop khi không dùng."),
+    (r"Simulator|launchd_sim|CoreSimulator", "iOS Simulator",
+     "Simulator đang mở — xcrun simctl shutdown all khi không dùng."),
+    (r"(^|/)(claude|codex|gemini)$|/claude/versions/", "AI agent CLI",
+     "Mỗi phiên agent giữ vài trăm MB — thoát các phiên không dùng."),
+    (r"com\.apple\.WebKit|/Safari\.app/", "Safari / WebKit", "Trình duyệt — đóng bớt tab nặng."),
+    (r"Google Chrome|Firefox|Microsoft Edge|Brave Browser|/Arc\.app/", None,
+     "Trình duyệt — đóng bớt tab (Chrome: Shift+Esc xem tab nào nặng)."),
+    (r"Xcode|SWBBuild|XCBBuild|SourceKit", "Xcode", "Xcode — đóng khi không dùng, nhất là lúc đang build Flutter."),
+    (r"Visual Studio Code|Cursor|Windsurf|Antigravity|Kiro|Android Studio", None,
+     "Editor — đóng bớt cửa sổ và extension không dùng."),
+)]
+
+
+class Procs:
+    """Ảnh chụp danh sách tiến trình: pid → (ppid, rss, %cpu, đường dẫn)."""
+
+    def __init__(self):
+        self.by_pid, self.kids = {}, {}
+        for line in run(["ps", "-Axo", "pid=,ppid=,rss=,pcpu=,comm="]).stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            try:
+                pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2]) * 1024
+                cpu = float(parts[3].replace(",", "."))
+            except ValueError:
+                continue
+            self.by_pid[pid] = (ppid, rss, cpu, parts[4])
+            self.kids.setdefault(ppid, []).append(pid)
+
+    def rss(self, pid):
+        """RAM của pid cộng mọi tiến trình con."""
+        total, stack, seen = 0, [pid] if pid and pid > 1 else [], set()
+        while stack:
+            p = stack.pop()
+            if p in seen or p not in self.by_pid:
+                continue
+            seen.add(p)
+            total += self.by_pid[p][1]
+            stack += self.kids.get(p, [])
+        return total
+
+
+def swap_usage():
+    m = re.search(r"total = ([\d.,]+)M\s+used = ([\d.,]+)M", run(["sysctl", "-n", "vm.swapusage"]).stdout)
+    if not m:
+        return None
+    total, used = (float(x.replace(",", ".")) * (1 << 20) for x in m.groups())
+    return used, total
+
+
+def cpu_speed_limit():
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", run(["pmset", "-g", "therm"]).stdout)
+    return int(m.group(1)) if m else None
+
+
+def uptime_days():
+    m = re.search(r"sec = (\d+)", run(["sysctl", "-n", "kern.boottime"]).stdout)
+    return (time.time() - int(m.group(1))) / DAY if m else None
+
+
+def diagnostics():
+    """Các dấu hiệu khiến máy lag: (nhãn, ghi chú, giải thích)."""
+    out = []
+    ncpu = os.cpu_count() or 1
+    l1, l5, _ = os.getloadavg()
+    if max(l1, l5) > ncpu:
+        out.append((f"Tải CPU {l1:.0f} · {l5:.0f} (1 · 5 phút), máy chỉ có {ncpu} luồng", "quá tải",
+                    "Nhiều tiến trình tranh CPU hơn số luồng nên mọi thứ phải xếp hàng — xem các app nặng bên dưới."))
+    sw = swap_usage()
+    if sw and sw[0] > GIB and sw[0] / sw[1] > 0.5:
+        out.append((f"Swap {sw[0] / GIB:.1f}/{sw[1] / GIB:.1f}G — RAM không đủ", "nên khởi động lại",
+                    "Máy phải đẩy dữ liệu RAM xuống ổ đĩa rồi đọc lại nên giật, lag. Xoá file không giúp được; "
+                    "swap chỉ được trả lại khi khởi động lại máy — và nên đóng bớt app nặng bên dưới."))
+    lim = cpu_speed_limit()
+    if lim is not None and lim < 100:
+        out.append((f"CPU chỉ được chạy {lim}% tốc độ", "máy nóng",
+                    "macOS đang hạ xung để giảm nhiệt (CPU_Speed_Limit). Kê máy thoáng, vệ sinh quạt, "
+                    "tránh build nặng liên tục."))
+    up = uptime_days()
+    if up is not None and up >= 7:
+        out.append((f"Máy đã bật {up:.0f} ngày chưa khởi động lại", "nên khởi động lại",
+                    "Khởi động lại để giải phóng swap, cache và các tiến trình bị kẹt."))
+    return out
+
+
+def app_name(path):
+    m = re.search(r"/([^/]+)\.app/", path)
+    return m.group(1) if m else os.path.basename(path)
+
+
+def proc_group(path):
+    for rx, name, tip in PROC_RULES:
+        if rx.search(path):
+            return name or app_name(path), tip
+    return app_name(path), ""
+
+
+def scan_perf(procs: Procs):
+    items = [Item("perf", label, "", kind="info", size=0, note=note, detail=why, extra={"warn": True})
+             for label, note, why in diagnostics()]
+    if not items:
+        items.append(Item("perf", "Tải CPU, RAM và nhiệt độ đang bình thường", "", kind="info", size=0,
+                          note="ổn", detail="Không thấy dấu hiệu quá tải lúc quét."))
+    groups = {}
+    me = os.getpid()
+    for pid, (_, rss, cpu, path) in procs.by_pid.items():
+        if pid == me:
+            continue
+        name, tip = proc_group(path)
+        g = groups.setdefault(name, [0, 0.0, 0, tip])
+        g[0] += rss
+        g[1] += cpu
+        g[2] += 1
+    heavy = sorted(((n, g) for n, g in groups.items() if g[0] >= 300 << 20 or g[1] >= 20),
+                   key=lambda x: x[1][0], reverse=True)
+    for name, (rss, cpu, n, tip) in heavy[:12]:
+        items.append(Item("perf", f"{name} · {n} tiến trình" if n > 1 else name, "", kind="info", size=rss,
+                          note=f"CPU {cpu:.0f}%",
+                          detail=tip or "Đang dùng nhiều RAM / CPU — thoát nếu không cần.",
+                          extra={"warn": cpu >= 50 or rss >= 1.5 * GIB}))
+    return items
+
+
+def advice(name, broken=None):
+    """(có nên tắt không, lý do) cho một mục tự chạy."""
+    if broken:
+        return True, f"Hỏng: không còn {broken} — mỗi lần đăng nhập vẫn chạy rồi lỗi."
+    for rx, why in KEEP_RULES:
+        if rx.search(name):
+            return False, why
+    if UPDATER_RE.search(name):
+        if BROWSER_RE.search(name):
+            return False, "Trình cập nhật của trình duyệt — nên giữ để nhận bản vá bảo mật."
+        return True, "Chỉ để tự cập nhật chạy nền — ứng dụng vẫn kiểm tra cập nhật khi bạn mở nó."
+    return False, ""
+
+
+def steps_text(steps):
+    """Một bước = [argv, bắt buộc thành công?, cần sudo?]; "@docker" là bước nội bộ của macclean."""
+    out = []
+    for argv, _, root in steps:
+        if argv[0] == "@docker":
+            out.append(f"macclean đặt AutoStart={argv[1]} trong cài đặt Docker")
+        else:
+            out.append(("sudo " if root else "") + shlex.join(argv))
+    return " && ".join(out)
+
+
+def startup_item(group, label, kind, *, rid, off, on_steps, off_steps, reason="", status="", size=0,
+                 suggested=False, facts=(), hint="", **extra):
+    reopen = hint or steps_text(on_steps) or "không tự mở lại được"
+    status = status or ("đã tắt" if off else "bật")
+    detail = f"Đã tắt · mở lại: chọn rồi nhấn e, hoặc {reopen}" if off else \
+        (reason or f"Nếu tắt, mở lại bằng: {reopen}")
+    info = [("Trạng thái", status), *[tuple(f) for f in facts], ("Nhận xét", reason or "—")]
+    if off_steps:
+        info.append(("Tắt bằng", steps_text(off_steps)))
+    info.append(("Mở lại bằng", reopen + (" (hoặc chọn mục này rồi nhấn e)" if on_steps else "")))
+    return Item(group, label, rid, kind=kind, detail=detail, note=status, size=size, suggested=suggested and not off,
+                extra={"id": rid, "state": "off" if off else "on", "on": on_steps, "off": off_steps,
+                       "reason": reason, "facts": [list(f) for f in facts], "hint": hint, "info": info,
+                       "bad": status.startswith(("hỏng", "lỗi")), **extra})
+
+
+def missing_program(pl):
+    """Đường dẫn chương trình / script mà plist trỏ tới nhưng không còn tồn tại."""
+    args = [a for a in pl.get("ProgramArguments") or [] if isinstance(a, str)]
+    prog = pl.get("Program") or (args[0] if args else "")
+    if prog.startswith("/") and not os.path.exists(prog):
+        return prog
+    if os.path.basename(prog).rstrip("0123456789.") in INTERPRETERS:
+        for a in args[1:]:
+            if a.startswith("-"):
+                continue
+            if a.startswith("/") and not os.path.exists(a):
+                return a
+            break
+    return None
+
+
+def launchctl_disabled(domain):
+    out = run(["launchctl", "print-disabled", domain]).stdout
+    return {m.group(1) for m in re.finditer(r'"([^"]+)" => (?:disabled|true)', out)}
+
+
+def launchctl_jobs():
+    """label → (pid, mã thoát gần nhất) của các job đã nạp trong domain gui của user."""
+    jobs = {}
+    for line in run(["launchctl", "list"]).stdout.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) == 3:
+            jobs[parts[2]] = (int(parts[0]) if parts[0].isdigit() else None, parts[1])
+    return jobs
+
+
+def launchctl_print(target):
+    r = run(["launchctl", "print", target], timeout=10)
+    if r.returncode:
+        return None
+    pid = re.search(r"^\tpid = (\d+)$", r.stdout, re.M)
+    code = re.search(r"^\tlast exit code = (-?\d+)", r.stdout, re.M)
+    return int(pid.group(1)) if pid else None, code.group(1) if code else "-"
+
+
+def scan_launchd(procs: Procs, brew_managed):
+    items = []
+    jobs = launchctl_jobs()
+    disabled = {f"gui/{UID}": launchctl_disabled(f"gui/{UID}"), "system": launchctl_disabled("system")}
+    for base, dom in ((HOME / "Library/LaunchAgents", f"gui/{UID}"),
+                      (Path("/Library/LaunchAgents"), f"gui/{UID}"),
+                      (Path("/Library/LaunchDaemons"), "system")):
+        for plist in sorted(base.glob("*.plist")):
+            pl = read_plist(plist)
+            label = pl.get("Label") or plist.stem
+            if label.startswith("com.apple.") or label in brew_managed:
+                continue
+            system = dom == "system"
+            file_root = HOME not in plist.parents        # plist ngoài home: chuyển file cần sudo
+            job = launchctl_print(f"system/{label}") if system else jobs.get(label)
+            pid, code = job or (None, None)
+            off = label in disabled[dom]
+            missing = missing_program(pl)
+            tgt = f"{dom}/{label}"
+            off_steps = [[["launchctl", "bootout", tgt], False, system],
+                         [["launchctl", "disable", tgt], True, system]]
+            extra = {}
+            if missing:  # plist hỏng: cất vào thư mục backup thay vì để chạy lỗi mãi
+                extra = {"moved_to": str(BACKUP_DIR / plist.name), "plist": str(plist), "file_root": file_root}
+                off_steps.append([["mv", str(plist), extra["moved_to"]], True, file_root])
+            on_steps = [[["launchctl", "enable", tgt], True, system],
+                        [["launchctl", "bootstrap", dom, str(plist)], False, system]]
+            if off:
+                status = "đã tắt"
+            elif missing:
+                status = "hỏng"
+            elif pid:
+                status = "đang chạy"
+            elif code and code not in ("0", "-"):
+                status = f"lỗi (exit {code})"
+            else:
+                status = "chờ" if job else "chưa nạp"
+            sugg, reason = advice(label, missing)
+            args = pl.get("ProgramArguments") or [pl.get("Program", "")]
+            items.append(startup_item(
+                "daemon" if system else "agent", label, "launchd", rid=f"launchd:{tgt}", off=off,
+                on_steps=on_steps, off_steps=off_steps, reason=reason, status=status,
+                size=procs.rss(pid), suggested=sugg,
+                facts=[("File", str(plist)), ("Chương trình", " ".join(map(str, args))), ("Domain", tgt)],
+                **extra))
+    return items
+
+
+def scan_brew(procs: Procs):
+    """Trả về (các mục brew services, tập label launchd do brew quản lý)."""
+    if not shutil.which("brew"):
+        return [], set()
+    try:
+        data = json.loads(run(["brew", "services", "info", "--all", "--json"], timeout=120).stdout) or []
+    except ValueError:
+        data = []
+    items, managed = [], set()
+    names = {"started": "đang chạy", "error": "lỗi", "scheduled": "chờ", "stopped": "đã dừng"}
+    state = load_state()
+    for s in data:
+        name = s.get("name") or ""
+        status = s.get("status") or "none"
+        on = status != "none" or bool(s.get("running"))
+        if on or s.get("loaded"):
+            managed |= {s.get("service_name") or "", f"homebrew.mxcl.{name}", Path(s.get("file") or "x").stem}
+        root = s.get("user") == "root"
+        rid = f"brew:{name}"
+        dev = bool(DEV_SERVICE_RE.search(name))
+        items.append(startup_item(
+            "brew", name, "brew", rid=rid, off=not on,
+            on_steps=[[["brew", "services", "start", name], True, root]],
+            off_steps=[[["brew", "services", "stop", name], True, root]],
+            reason="Dịch vụ dev chạy nền suốt — chỉ bật khi đang làm project cần nó." if dev
+            else "Dịch vụ Homebrew chạy nền.",
+            status=names.get(status, status) if on else ("đã tắt" if rid in state else "không chạy"),
+            size=procs.rss(s.get("pid")), suggested=on and dev,
+            facts=[("Lệnh", s.get("command") or s.get("file") or "")] + ([("Chạy bằng", "root")] if root else [])))
+    return items, managed
+
+
+LOGIN_SCRIPT = """tell application "System Events"
+set out to ""
+repeat with li in login items
+set out to out & (name of li) & tab & (path of li) & tab & (hidden of li) & linefeed
+end repeat
+return out
+end tell"""
+DOCKER_DIR = HOME / "Library/Group Containers/group.com.docker"
+LOGIN_HINT = "Cài đặt hệ thống → Chung → Mục đăng nhập → bấm + và chọn lại app"
+
+
+def as_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def docker_setting():
+    for fn, key in (("settings-store.json", "AutoStart"), ("settings.json", "autoStart")):
+        p = DOCKER_DIR / fn
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and key in data:
+            return p, key, data
+    return None
+
+
+def set_docker_autostart(value):
+    found = docker_setting()
+    if not found:
+        return "không tìm thấy file cài đặt của Docker Desktop"
+    p, key, data = found
+    data[key] = value
+    tmp = p.with_name(p.name + ".macclean-tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, p)
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def scan_login(procs: Procs):
+    items = []
+    r = run(["osascript", "-e", LOGIN_SCRIPT], timeout=30)
+    if r.returncode:
+        items.append(Item("login", "Không đọc được Mục đăng nhập", "", kind="info", size=0, note="cần quyền",
+                          detail="Cấp quyền: Cài đặt → Quyền riêng tư & Bảo mật → Tự động hoá → cho terminal "
+                                 "điều khiển System Events."))
+    for line in r.stdout.splitlines() if not r.returncode else []:
+        name, path, hidden = (line.split("\t") + ["", ""])[:3]
+        if not name:
+            continue
+        path = "" if path == "missing value" else path
+        broken = None if path and os.path.exists(path) else (path or "ứng dụng gốc")
+        sugg, reason = advice(name, broken)
+        off_steps = [[["osascript", "-e",
+                       f'tell application "System Events" to delete login item {as_str(name)}'], True, False]]
+        on_steps = [[["osascript", "-e",
+                      f'tell application "System Events" to make login item at end with properties '
+                      f'{{path:{as_str(path)}, hidden:{"true" if hidden == "true" else "false"}}}'],
+                     True, False]] if path else []
+        items.append(startup_item(
+            "login", name, "login", rid=f"login:{name}", off=False, on_steps=on_steps, off_steps=off_steps,
+            reason=reason, status="hỏng" if broken else "bật", suggested=sugg,
+            facts=[("Ứng dụng", path or "(không còn)")],
+            hint="" if path else "không mở lại được — ứng dụng đã bị gỡ; cài lại rồi " + LOGIN_HINT))
+
+    found = docker_setting()
+    if found:
+        p, key, data = found
+        on = bool(data[key])
+        running = any("/Docker.app/" in v[3] for v in procs.by_pid.values())
+        items.append(startup_item(
+            "login", "Docker Desktop · tự mở khi đăng nhập", "docker", rid="docker:autostart", off=not on,
+            on_steps=[[["@docker", "true"], True, False]], off_steps=[[["@docker", "false"], True, False]],
+            reason="Docker giữ máy ảo vài GB RAM ngay khi mở — chỉ mở Docker khi cần."
+                   + (" Docker đang mở: nên Quit Docker trước, kẻo nó ghi đè cài đặt." if running else ""),
+            status="bật" if on else "đã tắt", suggested=on,
+            facts=[("File", f"{p} ({key})")],
+            hint="Docker Desktop → Settings → General → Start Docker Desktop when you sign in"))
+    return items
+
+
+def load_state():
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    os.replace(tmp, STATE_FILE)
+
+
+def scan_startup():
+    procs = Procs()
+    brew, managed = scan_brew(procs)
+    items = brew + scan_login(procs) + scan_launchd(procs, managed)
+    # Mục đã tắt mà không còn thấy trên máy (login item đã gỡ, plist hỏng đã cất đi) → lấy từ lịch sử
+    state = load_state()
+    present = {it.extra["id"]: it for it in items}
+    changed = False
+    for rid, rec in list(state.items()):
+        it = present.get(rid)
+        if it is None:
+            items.append(startup_item(
+                rec["group"], rec["label"], rec["kind"], rid=rid, off=True, on_steps=rec["on"], off_steps=[],
+                reason=rec.get("reason", ""), facts=rec.get("facts", []) + [["Tắt lúc", rec.get("when", "?")]],
+                hint=rec.get("hint", "")))
+        elif it.extra["state"] == "on":
+            del state[rid]  # đã được bật lại bên ngoài macclean
+            changed = True
+        else:
+            it.extra["info"].insert(1, ("Tắt lúc", rec.get("when", "?")))
+    if changed:
+        save_state(state)
+    items.sort(key=lambda i: (not i.suggested, i.extra["state"] == "off", i.label.lower()))
+    return scan_perf(procs) + items
+
+
+def sudo_ready(prompt=None):
+    if run(["sudo", "-n", "true"]).returncode == 0:
+        return True
+    return bool(prompt and prompt())
+
+
+def run_steps(steps):
+    """Chạy các bước; trả về None nếu thành công, ngược lại là thông báo lỗi."""
+    for argv, required, root in steps:
+        if argv[0] == "@docker":
+            err = set_docker_autostart(argv[1] == "true")
+        else:
+            r = run((["sudo", "-n"] if root else []) + argv, timeout=180)
+            err = None if r.returncode == 0 else \
+                ((r.stderr.strip() or r.stdout.strip()).splitlines() or [f"exit {r.returncode}"])[-1]
+        if err and required:
+            return f"{steps_text([[argv, required, root]])}: {err}"
+    return None
+
+
+def toggle_items(items, enable, progress=None, sudo_prompt=None):
+    """Tắt (enable=False) hoặc bật lại các mục khởi động; trả về (số thành công, số lỗi)."""
+    key = "on" if enable else "off"
+    need_root = any(root for it in items for _, _, root in it.extra[key])
+    have_root = not need_root or sudo_ready(sudo_prompt)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    state = load_state()
+    ok = fail = 0
+    for n, it in enumerate(items, 1):
+        if progress:
+            progress(n, len(items), it)
+        steps = it.extra[key]
+        if not steps:
+            err = it.extra.get("hint") or "không tự mở lại được — hãy bật lại thủ công"
+        elif not have_root and any(root for _, _, root in steps):
+            err = "cần mật khẩu admin (sudo) — đã bỏ qua"
+        else:
+            err = run_steps(steps)
+        it.selected = False
+        if err:
+            it.error = err
+            fail += 1
+            continue
+        ok += 1
+        it.error = ""
+        rid = it.extra["id"]
+        if enable:
+            state.pop(rid, None)
+        elif it.extra["on"] or it.extra.get("moved_to"):  # chỉ ghi mục còn bật lại được
+            on = it.extra["on"]
+            if it.extra.get("moved_to"):  # plist đã được cất đi: bật lại thì chuyển về chỗ cũ trước
+                on = [[["mv", it.extra["moved_to"], it.extra["plist"]], True, it.extra["file_root"]]] + on
+            state[rid] = {"group": it.group, "label": it.label, "kind": it.kind, "on": on,
+                          "reason": it.extra["reason"], "facts": it.extra["facts"], "hint": it.extra["hint"],
+                          "when": datetime.now().strftime("%d/%m/%Y %H:%M")}
+        it.extra["state"] = key
+    save_state(state)
+    return ok, fail
+
+
 # ───────────────────────────── thông tin hệ thống ─────────────────────────────
 
 class SysInfo:
@@ -601,10 +1126,16 @@ class SysInfo:
         du = shutil.disk_usage(DATA_VOL)
         pct = du.used / (du.used + du.free) if du.used + du.free else 0
         parts.append((f"Ổ đĩa: {human(du.free)} trống ({pct:.0%} đã dùng)", pct > 0.9))
-        m = re.search(r"total = ([\d.,]+)M\s+used = ([\d.,]+)M", run(["sysctl", "-n", "vm.swapusage"]).stdout)
-        if m:
-            total, used = (float(x.replace(",", ".")) for x in m.groups())
-            parts.append((f"Swap: {used / 1024:.1f}/{total / 1024:.1f}G", total > 0 and used / total > 0.8))
+        sw = swap_usage()
+        if sw:
+            used, total = sw
+            parts.append((f"Swap: {used / GIB:.1f}/{total / GIB:.1f}G", total > 0 and used / total > 0.8))
+        ncpu = os.cpu_count() or 1
+        l1 = os.getloadavg()[0]
+        parts.append((f"Tải: {l1:.1f}/{ncpu}", l1 > ncpu))
+        lim = cpu_speed_limit()
+        if lim is not None and lim < 100:
+            parts.append((f"CPU: {lim}% tốc độ", True))
         batt = re.search(r"(\d+)%", run(["pmset", "-g", "batt"]).stdout)
         if batt:
             sp = run(["system_profiler", "SPPowerDataType"], timeout=30).stdout
@@ -628,56 +1159,100 @@ class SysInfo:
 C_SUGG, C_BIG, C_WARN, C_SEL, C_DIM, C_HEAD = range(1, 7)
 
 
+@dataclass
+class View:
+    key: str
+    name: str
+    groups: list
+    scan: object
+    items: list = field(default_factory=list)
+    collapsed: set = field(default_factory=set)
+    cur: int = 0
+    top: int = 0
+    scanning: bool = False
+    scanned: bool = False
+
+
+def _view_attr(name):
+    return property(lambda self: getattr(self.v, name), lambda self, val: setattr(self.v, name, val))
+
+
 class App:
-    def __init__(self, scr, dry_run=False):
+    items = _view_attr("items")
+    collapsed = _view_attr("collapsed")
+    cur = _view_attr("cur")
+    top = _view_attr("top")
+    scanning = _view_attr("scanning")
+
+    def __init__(self, scr, dry_run=False, view="disk"):
         self.scr = scr
         self.dry = dry_run
-        self.items: list[Item] = []
-        self.collapsed: set[str] = set()
-        self.cur = 0
-        self.top = 0
+        self.views = {"disk": View("disk", "Dung lượng", GROUPS, scan_all),
+                      "startup": View("startup", "Khởi động & hiệu năng", STARTUP_GROUPS, scan_startup)}
+        self.v = self.views[view]
         self.msg = ""
         self.msg_warn = False
-        self.scanning = False
         self.spin = 0
         self.sys = SysInfo()
         self.pool = ThreadPoolExecutor(max_workers=8)
 
+    @property
+    def startup(self):
+        return self.v.key == "startup"
+
     # ── quét ──
-    def start_scan(self):
-        if self.scanning:
+    def start_scan(self, keep=False, done_msg=None):
+        v = self.v
+        if v.scanning:
             return
-        self.scanning = True
-        self.items = []
-        self.cur = self.top = 0
+        v.scanning = v.scanned = True
+        v.items = []
+        if not keep:
+            v.cur = v.top = 0
         self.set_msg("Đang quét…")
         self.sys.refresh_async()
-        threading.Thread(target=self._scan, daemon=True).start()
+        threading.Thread(target=self._scan, args=(v, done_msg), daemon=True).start()
 
-    def _scan(self):
+    def _scan(self, v, done_msg=None):
+        msg, warn = "", False
         try:
-            items = scan_all()
-            self.items = items
+            items = v.scan()
+            v.items = items
             for f in [self.pool.submit(fill_size, it) for it in items if it.size is None]:
                 f.result()
             sugg = [i for i in items if i.suggested and visible(i)]
-            if sugg:
-                self.set_msg(f"Quét xong. Có {len(sugg)} mục gợi ý (*) · {human(sum(i.size or 0 for i in sugg))}"
-                             " — nhấn f để dọn nhanh.")
+            if done_msg:
+                msg, warn = done_msg
+            elif v.key == "startup":
+                msg = (f"Quét xong. Có {len(sugg)} mục nên tắt (*) — f tắt nhanh, i xem chi tiết, e bật lại."
+                       if sugg else "Quét xong. Không có mục nào cần tắt.")
+            elif sugg:
+                msg = (f"Quét xong. Có {len(sugg)} mục gợi ý (*) · {human(sum(i.size or 0 for i in sugg))}"
+                       " — nhấn f để dọn nhanh.")
             else:
-                self.set_msg("Quét xong. Không có mục gợi ý nào — máy đang gọn gàng.")
+                msg = "Quét xong. Không có mục gợi ý nào — máy đang gọn gàng."
         except Exception as e:  # noqa: BLE001
-            self.set_msg(f"Lỗi khi quét: {e}", warn=True)
+            msg, warn = f"Lỗi khi quét: {e}", True
         finally:
-            self.scanning = False
+            v.scanning = False
+        if v is self.v:
+            self.set_msg(msg, warn)
 
     def set_msg(self, text, warn=False):
         self.msg, self.msg_warn = text, warn
 
+    def switch(self, key):
+        if key == self.v.key:
+            return
+        self.v = self.views[key]
+        self.msg = ""
+        if not self.v.scanned:
+            self.start_scan()
+
     # ── danh sách hàng hiển thị ──
     def rows(self):
         out = []
-        for key, _, _ in GROUPS:
+        for key, _, _ in self.v.groups:
             its = [i for i in self.items if i.group == key and not i.deleted and visible(i)]
             if not its:
                 continue
@@ -708,15 +1283,20 @@ class App:
             scr.refresh()
             return
 
-        # tiêu đề
+        # tiêu đề + tab
         busy = self.scanning or self.pending()
         self.spin = (self.spin + 1) % 4
-        title = " macclean — dọn dẹp dung lượng Mac "
-        if self.dry:
-            title += "[DRY-RUN] "
+        self.put(0, 0, " macclean ", curses.A_BOLD | curses.color_pair(C_HEAD))
+        x = 10
+        for n, v in enumerate(self.views.values(), 1):
+            tab = f" {n} {v.name} "
+            self.put(0, x, tab, curses.A_REVERSE | curses.A_BOLD if v is self.v else curses.color_pair(C_DIM))
+            x += len(tab) + 1
+        extra = "[DRY-RUN] " if self.dry else ""
         if busy:
-            title += "|/-\\"[self.spin] + f" đang tính dung lượng ({self.pending()} mục)"
-        self.put(0, 0, fit(title, w), curses.A_BOLD | curses.color_pair(C_HEAD))
+            extra += "|/-\\"[self.spin] + (f" đang tính dung lượng ({self.pending()} mục)" if self.pending()
+                                         else " đang quét")
+        self.put(0, x, fit(extra, max(0, w - x - 1)), curses.A_BOLD | curses.color_pair(C_HEAD))
 
         # thông tin hệ thống
         x = 1
@@ -749,28 +1329,40 @@ class App:
             kind, obj, its = rows[idx]
             cursor = curses.A_REVERSE if idx == self.cur else 0
             if kind == "h":
-                total = sum(i.size or 0 for i in its)
                 nsel = sum(1 for i in its if i.selected)
                 arrow = "▸" if obj in self.collapsed else "▾"
-                right = f"{len(its)} mục · {human(total)}" + (f" · đã chọn {nsel}" if nsel else "")
+                if obj in STARTUP_KEYS:
+                    nsug = sum(1 for i in its if i.suggested)
+                    right = f"{len(its)} mục" + (f" · nên tắt {nsug}" if nsug else "")
+                else:
+                    right = f"{len(its)} mục · {human(sum(i.size or 0 for i in its))}"
+                right += f" · đã chọn {nsel}" if nsel else ""
                 left = f"{arrow} {GROUP_TITLE[obj]}"
                 line = fit(left, w - 2 - len(right) - 1) + right + " "
                 self.put(y, 0, line, curses.A_BOLD | curses.color_pair(C_HEAD) | cursor)
             else:
                 it = obj
-                mark = "[x]" if it.selected else "[ ]"
+                info = it.kind == "info"
+                mark = " • " if info else "[x]" if it.selected else "[ ]"
                 star = "*" if it.suggested else " "
-                big = it.size is not None and it.size >= 1 << 30
+                big = it.size is not None and it.size >= GIB
                 label_attr = curses.color_pair(C_SEL) | curses.A_BOLD if it.selected else 0
+                if info and it.extra.get("warn"):
+                    label_attr = curses.color_pair(C_WARN) | curses.A_BOLD
+                elif it.extra.get("state") == "off":
+                    label_attr = curses.color_pair(C_DIM)
                 if it.error:
                     label_attr = curses.color_pair(C_WARN)
+                size = "" if it.group in STARTUP_KEYS and not it.size else human(it.size)
                 self.put(y, 0, "  " + mark + " ", cursor | (curses.color_pair(C_SEL) if it.selected else 0))
                 self.put(y, 6, star + " ", cursor | curses.color_pair(C_SUGG) | curses.A_BOLD)
                 self.put(y, 8, fit(it.label, lw) + " ", cursor | label_attr)
-                self.put(y, 8 + lw + 1, fit(human(it.size), 8, ">"),
+                self.put(y, 8 + lw + 1, fit(size, 8, ">"),
                          cursor | (curses.color_pair(C_BIG) | curses.A_BOLD if big else 0))
                 note = "LỖI" if it.error else it.note
-                self.put(y, 8 + lw + 9, "  " + fit(note, nw) + " ", cursor | curses.color_pair(C_DIM))
+                bad = it.error or it.extra.get("bad")
+                self.put(y, 8 + lw + 9, "  " + fit(note, nw) + " ",
+                         cursor | curses.color_pair(C_WARN if bad else C_DIM))
 
         # thanh dưới
         self.put(h - 3, 0, "─" * (w - 1), curses.color_pair(C_DIM))
@@ -782,38 +1374,36 @@ class App:
             text = GROUP_DESC[obj] if kind == "h" else (f"Lỗi: {obj.error}" if obj.error else obj.detail)
             self.put(h - 2, 1, fit(text, w - 2), curses.color_pair(C_DIM))
         sel = [i for i in self.items if i.selected and not i.deleted]
-        left = f" Đã chọn {len(sel)} mục · {human(sum(i.size or 0 for i in sel))} "
-        fast = " f dọn nhanh "
-        keys = " Space chọn  a cả nhóm  s gợi ý  u bỏ chọn  d xoá  Enter mở/đóng  r quét lại  q thoát"
+        if self.startup:
+            left = f" Đã chọn {len(sel)} mục "
+            fast = " f tắt nhanh "
+            keys = " Space chọn  s gợi ý  d tắt  e bật lại  i chi tiết  Tab dung lượng  r quét lại  q thoát"
+        else:
+            left = f" Đã chọn {len(sel)} mục · {human(sum(i.size or 0 for i in sel))} "
+            fast = " f dọn nhanh "
+            keys = " Space chọn  a cả nhóm  s gợi ý  d xoá  i chi tiết  Tab khởi động  r quét lại  q thoát"
         self.put(h - 1, 0, left, curses.A_REVERSE | curses.A_BOLD)
         self.put(h - 1, len(left) + 1, fast, curses.A_REVERSE | curses.A_BOLD | curses.color_pair(C_SUGG))
         x = len(left) + 1 + len(fast)
         self.put(h - 1, x, fit(keys, w - x - 1), curses.color_pair(C_DIM))
         scr.refresh()
 
-    # ── hộp thoại xác nhận ──
-    def confirm(self, sel):
+    # ── hộp thoại ──
+    def popup(self, lines, color=C_WARN, bold=()):
+        """Hiện hộp thoại giữa màn hình, chờ một phím và trả về phím đó."""
         h, w = self.scr.getmaxyx()
-        total = sum(i.size or 0 for i in sel)
-        bw = min(w - 4, 76)
-        maxn = max(1, min(len(sel), h - 12))
-        lines = [f"Xoá {len(sel)} mục, khoảng {human(total)}?", ""]
-        lines += [f" • {fit(i.label, bw - 16)} {fit(human(i.size), 8, '>')}" for i in sel[:maxn]]
-        if len(sel) > maxn:
-            lines.append(f"   … và {len(sel) - maxn} mục khác")
-        lines += ["", "(DRY-RUN: không xoá thật)" if self.dry else "Thao tác này KHÔNG hoàn tác được.",
-                  "Nhấn  y  để xoá, phím bất kỳ để huỷ."]
+        bw = min(w - 4, 90)
+        lines = lines[:max(1, h - 4)]
         bh = len(lines) + 2
         win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
         win.bkgd(" ", curses.color_pair(0))
         win.erase()
-        win.attron(curses.color_pair(C_WARN))
+        win.attron(curses.color_pair(color))
         win.border()
-        win.attroff(curses.color_pair(C_WARN))
+        win.attroff(curses.color_pair(color))
         for n, line in enumerate(lines):
-            attr = curses.A_BOLD if n == 0 or n >= len(lines) - 2 else 0
             try:
-                win.addstr(1 + n, 2, fit(line, bw - 4), attr)
+                win.addstr(1 + n, 2, fit(line, bw - 4), curses.A_BOLD if n in bold or n - len(lines) in bold else 0)
             except curses.error:
                 pass
         win.refresh()
@@ -824,7 +1414,31 @@ class App:
             k = None
         finally:
             self.scr.timeout(250)
-        return k in ("y", "Y")
+        return k
+
+    def confirm(self, head, entries, notes):
+        h, w = self.scr.getmaxyx()
+        maxn = max(1, min(len(entries), h - 12))
+        lines = [head, ""] + entries[:maxn]
+        if len(entries) > maxn:
+            lines.append(f"   … và {len(entries) - maxn} mục khác")
+        lines += [""] + notes
+        return self.popup(lines, bold=(0, -1, -2)) in ("y", "Y")
+
+    def show_info(self, it):
+        bw = min(self.scr.getmaxyx()[1] - 4, 90) - 4
+        if it.extra.get("info"):
+            facts = it.extra["info"]
+        elif it.kind == "info":
+            facts = [("Chi tiết", it.detail), ("RAM", human(it.size) if it.size else "—"), ("Ghi chú", it.note)]
+        else:
+            facts = [("Đường dẫn", it.detail), ("Dung lượng", human(it.size)), ("Ghi chú", it.note or "—"),
+                     ("Gợi ý xoá", "có" if it.suggested else "không")]
+        lines = [it.label, ""]
+        for k, val in facts + ([("Lỗi", it.error)] if it.error else []):
+            lines += textwrap.wrap(f"{k}: {val}", bw, subsequent_indent="    ", break_on_hyphens=False) or [k]
+        lines += ["", "Nhấn phím bất kỳ để đóng."]
+        self.popup(lines, color=C_HEAD, bold=(0,))
 
     # ── xoá ──
     def delete_selected(self):
@@ -835,7 +1449,11 @@ class App:
         if self.scanning:
             self.set_msg("Đang quét, đợi quét xong rồi xoá nhé.", warn=True)
             return
-        if not self.confirm(sel):
+        bw = min(self.scr.getmaxyx()[1] - 4, 90)
+        entries = [f" • {fit(i.label, bw - 16)} {fit(human(i.size), 8, '>')}" for i in sel]
+        notes = ["(DRY-RUN: không xoá thật)" if self.dry else "Thao tác này KHÔNG hoàn tác được.",
+                 "Nhấn  y  để xoá, phím bất kỳ để huỷ."]
+        if not self.confirm(f"Xoá {len(sel)} mục, khoảng {human(sum(i.size or 0 for i in sel))}?", entries, notes):
             self.set_msg("Đã huỷ.")
             return
         if self.dry:
@@ -855,6 +1473,60 @@ class App:
             msg += f" {fail} mục lỗi (tô đỏ, đưa con trỏ vào để xem chi tiết)."
         self.set_msg(msg, warn=bool(fail))
 
+    # ── tắt / bật lại mục khởi động ──
+    def ask_sudo(self):
+        curses.def_prog_mode()
+        curses.endwin()
+        print("\nmacclean cần quyền quản trị (sudo) để tắt / bật dịch vụ hệ thống.", flush=True)
+        try:
+            ok = subprocess.run(["sudo", "-v"]).returncode == 0
+        except (OSError, KeyboardInterrupt):
+            ok = False
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        return ok
+
+    def toggle_selected(self, enable):
+        want = "off" if enable else "on"
+        sel = [i for i in self.items if i.selected and i.kind in ACTION_KINDS and i.extra["state"] == want]
+        if not sel:
+            self.set_msg("Chọn các mục 'đã tắt' (Space) rồi nhấn e để bật lại." if enable else
+                         "Chưa chọn mục nào đang bật (Space để chọn, s để chọn các mục nên tắt).", warn=True)
+            return
+        if self.scanning:
+            self.set_msg("Đang quét, đợi quét xong nhé.", warn=True)
+            return
+        verb = "Bật lại" if enable else "Tắt"
+        key = "on" if enable else "off"
+        root = any(r for i in sel for _, _, r in i.extra[key])
+        bw = min(self.scr.getmaxyx()[1] - 4, 90)
+        entries = [f" • {fit(i.label, bw - 30)}  {fit(GROUP_TITLE[i.group].split(' ·')[0], 20)}" for i in sel]
+        notes = ["(DRY-RUN: không thay đổi gì)" if self.dry else
+                 "Chạy lại ngay và ở lần đăng nhập sau." if enable else
+                 "Mở lại bất cứ lúc nào: chọn mục rồi nhấn e (hoặc xem i / macclean --startup)."]
+        if root and not self.dry:
+            notes.append("Có mục hệ thống — sẽ hỏi mật khẩu admin (sudo).")
+        notes.append(f"Nhấn  y  để {verb.lower()}, phím bất kỳ để huỷ.")
+        if not self.confirm(f"{verb} {len(sel)} mục khởi động?", entries, notes):
+            self.set_msg("Đã huỷ.")
+            return
+        if self.dry:
+            for i in sel:
+                i.selected = False
+            self.set_msg(f"DRY-RUN: sẽ {verb.lower()} {len(sel)} mục.")
+            return
+
+        def progress(n, total, it):
+            self.set_msg(f"[{n}/{total}] {verb}: {it.label}…")
+            self.draw()
+
+        ok, fail = toggle_items(sel, enable, progress, self.ask_sudo)
+        errs = [f"{i.label}: {i.error}" for i in sel if i.error]
+        msg = f"Đã {verb.lower()} {ok} mục." + (" Xem lại cách mở lại: i trên từng mục." if ok and not enable else "")
+        if fail:
+            msg += f" {fail} lỗi — {errs[0]}"
+        self.start_scan(keep=True, done_msg=(msg, bool(fail)))
+
     # ── xử lý phím ──
     def handle(self, k):
         rows = self.rows()
@@ -863,9 +1535,14 @@ class App:
         if k not in (curses.KEY_RESIZE,):
             if not self.scanning and not self.msg.startswith("["):
                 self.msg = ""
+        selectable = (lambda i: i.kind != "info")
 
         if k in ("q", "Q"):
             return False
+        elif k in ("\t", curses.KEY_BTAB):
+            self.switch("startup" if self.v.key == "disk" else "disk")
+        elif k in ("1", "2"):
+            self.switch("disk" if k == "1" else "startup")
         elif k in (curses.KEY_UP, "k"):
             self.cur -= 1
         elif k in (curses.KEY_DOWN, "j"):
@@ -881,12 +1558,22 @@ class App:
         elif k == " " and cur:
             kind, obj, its = cur
             if kind == "h":
+                its = [i for i in its if selectable(i)]
                 state = not all(i.selected for i in its)
                 for i in its:
                     i.selected = state
+            elif not selectable(obj):
+                self.set_msg(obj.detail or "Mục thông tin — không chọn được.")
+                self.cur += 1
             else:
                 obj.selected = not obj.selected
                 self.cur += 1
+        elif k in ("i", "I", "?") and cur:
+            kind, obj, _ = cur
+            if kind == "h":
+                self.set_msg(GROUP_DESC[obj])
+            else:
+                self.show_info(obj)
         elif k in ("\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT, curses.KEY_LEFT, "l", "h") and cur:
             kind, obj, _ = cur
             key = obj if kind == "h" else obj.group
@@ -900,20 +1587,21 @@ class App:
         elif k == "a" and cur:
             kind, obj, _ = cur
             key = obj if kind == "h" else obj.group
-            its = [i for i in self.items if i.group == key and not i.deleted and visible(i)]
+            its = [i for i in self.items if i.group == key and not i.deleted and visible(i) and selectable(i)]
             state = not all(i.selected for i in its)
             for i in its:
                 i.selected = state
         elif k == "f":
+            what = "tắt nhanh" if self.startup else "dọn nhanh"
             if self.scanning:
-                self.set_msg("Đang quét, đợi quét xong rồi dọn nhanh nhé.", warn=True)
+                self.set_msg(f"Đang quét, đợi quét xong rồi {what} nhé.", warn=True)
             elif not any(i.suggested and visible(i) and not i.deleted for i in self.items):
-                self.set_msg("Không có mục gợi ý nào để dọn nhanh.")
+                self.set_msg(f"Không có mục gợi ý nào để {what}.")
             else:
                 for i in self.items:
                     if i.suggested and visible(i) and not i.deleted:
                         i.selected = True
-                self.delete_selected()
+                self.toggle_selected(False) if self.startup else self.delete_selected()
         elif k == "c":
             keys = {i.group for i in self.items}
             self.collapsed = set() if self.collapsed >= keys else keys
@@ -928,9 +1616,14 @@ class App:
             for i in self.items:
                 i.selected = False
         elif k in ("d", "D", "x", curses.KEY_DC):
-            self.delete_selected()
+            self.toggle_selected(False) if self.startup else self.delete_selected()
+        elif k in ("e", "E"):
+            if self.startup:
+                self.toggle_selected(True)
+            else:
+                self.set_msg("Phím e (bật lại) dùng ở tab 2 Khởi động & hiệu năng.")
         elif k in ("r", "R"):
-            self.start_scan()
+            self.start_scan(keep=self.startup)
         return True
 
     def loop(self):
@@ -1018,12 +1711,43 @@ def report():
     print(f"\nTổng: {human(grand)} · Gợi ý (*) có thể xoá: {human(sugg_total)}")
 
 
+def startup_report():
+    print("Đang quét…", file=sys.stderr)
+    items = scan_startup()
+    sinfo = SysInfo()
+    sinfo.refresh()
+    print(" │ ".join(t for t, _ in sinfo.parts))
+    nsug = 0
+    for key, title, _ in STARTUP_GROUPS:
+        its = [i for i in items if i.group == key]
+        if not its:
+            continue
+        print(f"\n▾ {title}")
+        for i in its:
+            nsug += i.suggested
+            size = human(i.size) if i.size else ""
+            print(f"  {'*' if i.suggested else ' '} {fit(i.label, 54)} {fit(size, 8, '>')}  {i.note}")
+            if i.kind == "info":
+                print(f"      {i.detail}")
+                continue
+            if i.extra["reason"] and i.suggested:
+                print(f"      vì sao: {i.extra['reason']}")
+            if i.extra["state"] == "off":
+                print(f"      mở lại: {i.extra['hint'] or steps_text(i.extra['on']) or 'không tự mở lại được'}")
+    print(f"\n* = nên tắt ({nsug} mục). Tắt / bật lại: mở macclean, nhấn Tab, chọn mục rồi nhấn d (tắt) hoặc e (bật lại).")
+    print(f"Lịch sử các mục macclean đã tắt: {STATE_FILE}")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="macclean", description="TUI dọn dẹp dung lượng cho máy Mac dev.")
     ap.add_argument("--dry-run", action="store_true", help="chạy thử, không xoá thật")
     ap.add_argument("--list", action="store_true", help="in báo cáo rồi thoát (không mở TUI)")
     ap.add_argument("--quick", action="store_true", help="dọn nhanh các mục gợi ý (*) không cần TUI")
     ap.add_argument("-y", "--yes", action="store_true", help="dùng với --quick: không hỏi xác nhận")
+    ap.add_argument("--startup", action="store_true",
+                    help="in báo cáo khởi động & hiệu năng (kèm lệnh mở lại) rồi thoát")
+    ap.add_argument("--tab", choices=("disk", "startup"), default="disk",
+                    help="tab mở sẵn khi vào TUI (mặc định: disk)")
     args = ap.parse_args()
     if args.yes and not args.quick:
         ap.error("--yes chỉ dùng cùng --quick")
@@ -1031,12 +1755,14 @@ def main():
         sys.exit("macclean chỉ chạy trên macOS.")
     if args.list:
         return report()
+    if args.startup:
+        return startup_report()
     if args.quick:
         return quick(args.dry_run, args.yes)
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
     try:
-        curses.wrapper(lambda scr: App(scr, args.dry_run).loop())
+        curses.wrapper(lambda scr: App(scr, args.dry_run, args.tab).loop())
     except KeyboardInterrupt:
         pass
 

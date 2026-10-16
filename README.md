@@ -4,6 +4,8 @@
 
 A terminal TUI to **inspect and free up disk space** on a developer Mac: Xcode, iOS Simulator, Gradle/Android, Flutter, AI agent leftovers and app caches.
 
+A second tab, **Startup & performance** (*Khởi động & hiệu năng*), explains why the Mac is slow (swap, CPU load, thermal throttling, heavy apps) and lets you **disable and re-enable** things that run in the background: Homebrew services, login items, LaunchAgents and LaunchDaemons.
+
 ```
  macclean — dọn dẹp dung lượng Mac
  Ổ đĩa: 110.3G trống (76% đã dùng) │ Swap: 8.9/10.0G │ Pin: 73%, 884 chu kỳ │ SIP: bật
@@ -59,6 +61,8 @@ macclean --dry-run        # trial run, nothing is deleted
 macclean --list           # print a report to the terminal and exit
 macclean --quick          # clean all suggested items without the TUI (asks y/N)
 macclean --quick --yes    # clean without asking (for scripts / cron)
+macclean --tab startup    # open the TUI on the Startup & performance tab
+macclean --startup        # print the startup & performance report (with re-enable commands) and exit
 ```
 
 ### ⚡ Quick clean
@@ -77,7 +81,10 @@ To see what would be deleted first, run `macclean --quick --dry-run`.
 | `Enter` / `←` `→` | expand / collapse a group (`c` for all groups) |
 | `s` | select the suggested items (`*`) |
 | `u` | deselect everything |
-| `d` | delete the selected items (asks for confirmation) |
+| `d` | delete the selected items (asks for confirmation); on tab 2 it **disables** them |
+| `e` | tab 2: **re-enable** the selected disabled items |
+| `i` | show details for the item under the cursor: path, status, the disable command and the **re-enable command** |
+| `Tab` / `1` `2` | switch between the Disk tab and the Startup & performance tab |
 | `r` | rescan |
 | `q` | quit |
 
@@ -96,7 +103,34 @@ To see what would be deleted first, run `macclean --quick --dry-run`.
 | App caches | `~/Library/Caches/*` (≥ 50 MB), npm cache | Homebrew, CocoaPods, Yarn, pip, npm…, and app updater leftovers (`*.ShipIt`) |
 | Trash | `~/.Trash` | always |
 
-The top bar also shows the machine's state: free disk space, swap, battery health and SIP status. Anything worth worrying about is shown in red.
+The top bar also shows the machine's state: free disk space, swap, CPU load, thermal throttling, battery health and SIP status. Anything worth worrying about is shown in red.
+
+## Startup & performance (tab 2)
+
+If the Mac is slow but the disk still has free space, deleting files won't help: the usual causes are too little RAM (swap is full), an overloaded CPU or heat. Press `Tab` (or run `macclean --tab startup`) to see:
+
+| Group | Shows | Suggested to disable `*` when |
+|---|---|---|
+| Performance | swap, CPU load vs. thread count, `CPU_Speed_Limit` (thermal throttling), days since the last restart; the apps using the most RAM / CPU (grouped per app) with a tip | view only, macclean never quits apps |
+| Homebrew services | `brew services` (MySQL, PostgreSQL, MongoDB, Redis…) | running and a database / dev service |
+| Login items | Login Items; Docker's *Start Docker Desktop when you sign in* | the app was uninstalled; Docker starting at login |
+| LaunchAgents | `~/Library/LaunchAgents`, `/Library/LaunchAgents` (`com.apple.*` is skipped) | broken (its program or script is gone), or only an auto-updater |
+| LaunchDaemons | `/Library/LaunchDaemons` | same as above |
+
+Never suggested: browser updaters (security patches), VPNs, license checkers, company security / MDM agents, Docker's helper services.
+
+**Disabling and re-enabling:**
+
+- Select items with `Space` (or `s` / `f` for the `*` items) and press `d` to disable them. To turn one back on, select a disabled item and press `e`.
+- Press `i` on an item to see the exact command macclean will run and the **command to re-enable it by hand**. `macclean --startup` prints these too.
+- How each kind is disabled (all of it is reversible):
+  - Homebrew: `brew services stop <name>`, re-enabled with `brew services start <name>`.
+  - LaunchAgent / Daemon: `launchctl bootout` + `launchctl disable`, re-enabled with `launchctl enable` + `launchctl bootstrap`. The plist is **not deleted**.
+  - A **broken** plist is moved to `~/.local/state/macclean/launchd-backup/`; re-enabling moves it back.
+  - Login item: removed from the list; re-enabling adds the same app back.
+  - Docker: sets `AutoStart` in `settings-store.json`, the same as *Docker → Settings → General → Start Docker Desktop when you sign in*.
+- Everything macclean disables is recorded in `~/.local/state/macclean/disabled.json` (when it was disabled and how to re-enable it), so items that no longer show up in the system lists still appear as disabled and can be turned back on.
+- Items in `/Library/LaunchDaemons` need admin rights: macclean leaves the TUI briefly to ask for your `sudo` password, then comes back.
 
 ## Safety
 
@@ -105,5 +139,6 @@ The top bar also shows the machine's state: free disk space, swap, battery healt
 - Simulators and runtimes are removed with `xcrun simctl delete` / `xcrun simctl runtime delete`, never by deleting files directly.
 - Gradle daemons are stopped before Gradle caches are deleted.
 - Deletion is **permanent**; nothing goes to the Trash. If in doubt, run with `--dry-run` first.
+- On the Startup & performance tab macclean only **disables**, it never deletes; `--dry-run` applies to disabling / re-enabling too.
 
 > **Note:** Deleting an archive also deletes its dSYMs, so crash logs from that build can no longer be symbolicated. This doesn't matter if you have already uploaded the dSYMs to Crashlytics or Sentry.

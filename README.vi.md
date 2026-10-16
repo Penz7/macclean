@@ -4,6 +4,8 @@
 
 Tool TUI chạy trong terminal để **kiểm tra và dọn dung lượng** trên máy Mac dùng để lập trình: Xcode, iOS Simulator, Gradle/Android, Flutter, rác của AI agent, cache ứng dụng.
 
+Tab thứ hai, **Khởi động & hiệu năng**, giải thích vì sao máy lag (swap, tải CPU, CPU bị hạ xung vì nóng, app nặng) và cho bạn **tắt / bật lại** những thứ tự chạy nền: Homebrew services, mục mở khi đăng nhập, LaunchAgents / LaunchDaemons.
+
 ```
  macclean — dọn dẹp dung lượng Mac
  Ổ đĩa: 110.3G trống (76% đã dùng) │ Swap: 8.9/10.0G │ Pin: 73%, 884 chu kỳ │ SIP: bật
@@ -57,6 +59,8 @@ macclean --dry-run        # chạy thử, không xoá thật
 macclean --list           # in báo cáo ra terminal rồi thoát
 macclean --quick          # dọn nhanh các mục gợi ý, không mở TUI (có hỏi y/N)
 macclean --quick --yes    # dọn nhanh, không hỏi lại (dùng cho script / cron)
+macclean --tab startup    # mở TUI ở tab Khởi động & hiệu năng
+macclean --startup        # in báo cáo khởi động & hiệu năng (kèm lệnh mở lại) rồi thoát
 ```
 
 ### ⚡ Dọn nhanh
@@ -75,7 +79,10 @@ Muốn xem trước những gì sẽ bị xoá thì chạy `macclean --quick --d
 | `Enter` / `←` `→` | mở / đóng nhóm (`c` để mở / đóng tất cả) |
 | `s` | chọn các mục được gợi ý (`*`) |
 | `u` | bỏ chọn tất cả |
-| `d` | xoá các mục đã chọn (có hỏi xác nhận) |
+| `d` | xoá các mục đã chọn (có hỏi xác nhận); ở tab 2 là **tắt** |
+| `e` | tab 2: **bật lại** các mục đã tắt đang được chọn |
+| `i` | xem chi tiết mục đang đứng: đường dẫn, trạng thái, lệnh tắt và **lệnh mở lại** |
+| `Tab` / `1` `2` | chuyển giữa tab Dung lượng và tab Khởi động & hiệu năng |
 | `r` | quét lại |
 | `q` | thoát |
 
@@ -94,7 +101,34 @@ Muốn xem trước những gì sẽ bị xoá thì chạy `macclean --quick --d
 | Cache ứng dụng | `~/Library/Caches/*` (≥ 50 MB), cache npm | Homebrew, CocoaPods, Yarn, pip, npm…, và bộ cài cập nhật còn sót (`*.ShipIt`) |
 | Thùng rác | `~/.Trash` | luôn gợi ý |
 
-Dòng trên cùng còn cho biết tình trạng máy: dung lượng trống, swap, tình trạng pin và trạng thái SIP. Mục nào đáng lo sẽ được tô đỏ.
+Dòng trên cùng còn cho biết tình trạng máy: dung lượng trống, swap, tải CPU, CPU có bị hạ xung không, tình trạng pin và trạng thái SIP. Mục nào đáng lo sẽ được tô đỏ.
+
+## Khởi động & hiệu năng (tab 2)
+
+Máy lag mà ổ đĩa vẫn còn trống thì dọn file không giúp được: thủ phạm thường là thiếu RAM (swap đầy), CPU quá tải hoặc máy nóng. Nhấn `Tab` (hoặc chạy `macclean --tab startup`) để xem:
+
+| Nhóm | Hiển thị | Được gợi ý tắt `*` khi |
+|---|---|---|
+| Hiệu năng | swap, tải CPU so với số luồng, `CPU_Speed_Limit` (hạ xung vì nóng), số ngày chưa khởi động lại; các app tốn RAM / CPU nhất (gộp theo app) kèm lời khuyên | chỉ để xem, macclean không tự tắt app |
+| Homebrew services | `brew services` (MySQL, PostgreSQL, MongoDB, Redis…) | đang chạy và là database / dịch vụ dev |
+| Mở khi đăng nhập | Login Items; tuỳ chọn *Start Docker Desktop when you sign in* | app đã bị gỡ; Docker tự mở khi đăng nhập |
+| LaunchAgents | `~/Library/LaunchAgents`, `/Library/LaunchAgents` (bỏ qua `com.apple.*`) | hỏng (chương trình / script không còn), hoặc chỉ là trình tự cập nhật |
+| LaunchDaemons | `/Library/LaunchDaemons` | như trên |
+
+Không gợi ý tắt: updater của trình duyệt (để nhận bản vá bảo mật), VPN, kiểm tra bản quyền, phần mềm bảo mật / MDM của công ty, dịch vụ phụ của Docker.
+
+**Tắt và mở lại:**
+
+- Chọn mục bằng `Space` (hoặc `s` / `f` cho các mục `*`), nhấn `d` để tắt. Muốn bật lại thì chọn mục "đã tắt" rồi nhấn `e`.
+- Nhấn `i` trên một mục để xem đúng lệnh mà macclean sẽ chạy và **lệnh để mở lại bằng tay**. `macclean --startup` cũng in các lệnh này.
+- Cách tắt từng loại (đều đảo ngược được):
+  - Homebrew: `brew services stop <tên>`, mở lại bằng `brew services start <tên>`.
+  - LaunchAgent / Daemon: `launchctl bootout` + `launchctl disable`, mở lại bằng `launchctl enable` + `launchctl bootstrap`. Plist **không bị xoá**.
+  - Plist **hỏng** thì được cất vào `~/.local/state/macclean/launchd-backup/`, bật lại sẽ chuyển về chỗ cũ.
+  - Login Item: gỡ khỏi danh sách, bật lại sẽ thêm lại đúng app đó.
+  - Docker: đặt `AutoStart` trong `settings-store.json`, tương đương *Docker → Settings → General → Start Docker Desktop when you sign in*.
+- Mọi mục macclean đã tắt được ghi vào `~/.local/state/macclean/disabled.json` (thời điểm tắt và cách mở lại), nên kể cả mục đã biến khỏi danh sách hệ thống vẫn hiện "đã tắt" để bật lại được.
+- Mục trong `/Library/LaunchDaemons` cần quyền admin: macclean tạm thoát giao diện để hỏi mật khẩu `sudo`, rồi quay lại.
 
 ## An toàn
 
@@ -103,5 +137,6 @@ Dòng trên cùng còn cho biết tình trạng máy: dung lượng trống, swa
 - Simulator và runtime được xoá bằng `xcrun simctl delete` / `xcrun simctl runtime delete`, không xoá file trực tiếp.
 - Tự tắt Gradle daemon trước khi xoá cache Gradle.
 - Xoá là **xoá hẳn**, không qua Thùng rác. Nếu không chắc, hãy chạy `--dry-run` trước.
+- Ở tab Khởi động & hiệu năng, macclean chỉ **tắt** chứ không xoá; `--dry-run` cũng áp dụng cho việc tắt / bật.
 
 > **Lưu ý:** Xoá Archive thì mất luôn dSYM của bản build đó, nên không thể symbolicate crash log của bản ấy nữa. Nếu bạn đã upload dSYM lên Crashlytics hoặc Sentry thì không sao.
