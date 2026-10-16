@@ -1,6 +1,8 @@
 # macclean
 
-Tool TUI chạy trong terminal để **kiểm tra và dọn dung lượng** trên máy Mac dùng để lập trình: Xcode, iOS Simulator, Gradle/Android, Flutter, cache ứng dụng.
+**English** · [Tiếng Việt](README.vi.md)
+
+A terminal TUI to **inspect and free up disk space** on a developer Mac: Xcode, iOS Simulator, Gradle/Android, Flutter and app caches.
 
 ```
  macclean — dọn dẹp dung lượng Mac
@@ -18,86 +20,88 @@ Tool TUI chạy trong terminal để **kiểm tra và dọn dung lượng** trê
  Đã chọn 2 mục · 624.0M  f dọn nhanh  Space chọn  a cả nhóm  s gợi ý  d xoá  q thoát
 ```
 
-## Cài đặt nhanh
+> The interface text is in Vietnamese. The keys and command-line flags are listed in English below.
 
-Yêu cầu: macOS và `python3` (có sẵn khi đã cài Xcode hoặc Command Line Tools). Không cần cài thêm thư viện nào.
+## Quick install
+
+Requirements: macOS and `python3`, which comes with Xcode or the Command Line Tools. No extra packages are needed.
 
 ```bash
 gh repo clone Penz7/macclean ~/macclean && ~/macclean/install.sh
 ```
 
-Lệnh này cài vào `~/.local/bin/macclean`. Nếu thư mục đó chưa nằm trong `PATH`, script sẽ in ra lệnh để thêm.
+This installs the tool to `~/.local/bin/macclean`. If that folder is not on your `PATH`, the script prints the line to add it.
 
 <details>
-<summary>Các cách cài khác</summary>
+<summary>Other install options</summary>
 
 ```bash
-# Dùng symlink: mỗi lần git pull là có bản mới luôn
+# Symlink instead of copy: every git pull updates the tool
 ~/macclean/install.sh --link
 
-# Cài vào thư mục khác
+# Install to a different folder
 PREFIX=/usr/local/bin ~/macclean/install.sh
 
-# Không clone, chỉ tải đúng 1 file (cần gh đã đăng nhập)
+# Download just the script, no clone (needs gh to be logged in)
 mkdir -p ~/.local/bin && gh api repos/Penz7/macclean/contents/macclean \
   -H "Accept: application/vnd.github.raw" > ~/.local/bin/macclean && chmod +x ~/.local/bin/macclean
 
-# Gỡ cài đặt
+# Uninstall
 ~/macclean/install.sh --uninstall
 ```
 </details>
 
-## Sử dụng
+## Usage
 
 ```bash
-macclean                  # mở giao diện TUI
-macclean --dry-run        # chạy thử, không xoá thật
-macclean --list           # in báo cáo ra terminal rồi thoát
-macclean --quick          # dọn nhanh các mục gợi ý, không mở TUI (có hỏi y/N)
-macclean --quick --yes    # dọn nhanh, không hỏi lại (dùng cho script / cron)
+macclean                  # open the TUI
+macclean --dry-run        # trial run, nothing is deleted
+macclean --list           # print a report to the terminal and exit
+macclean --quick          # clean all suggested items without the TUI (asks y/N)
+macclean --quick --yes    # clean without asking (for scripts / cron)
 ```
 
-### ⚡ Dọn nhanh
+### ⚡ Quick clean
 
-Không cần tick từng mục: mở `macclean`, đợi quét xong, nhấn **`f`** rồi **`y`**. Toàn bộ mục được gợi ý `*` sẽ bị xoá.
-Muốn xem trước những gì sẽ bị xoá thì chạy `macclean --quick --dry-run`.
+You don't have to tick items one by one: open `macclean`, wait for the scan to finish, then press **`f`** and **`y`**. Every item marked `*` (suggested) gets deleted.
+To see what would be deleted first, run `macclean --quick --dry-run`.
 
-### Phím tắt
+### Keys
 
-| Phím | Tác dụng |
+| Key | Action |
 |---|---|
-| **`f`** | **dọn nhanh**: chọn mọi mục gợi ý `*` rồi hỏi xác nhận xoá |
-| `↑` `↓` / `j` `k` | di chuyển (`PgUp` `PgDn`, `g` `G` để nhảy) |
-| `Space` | chọn / bỏ chọn; trên tiêu đề nhóm thì chọn cả nhóm |
-| `a` | chọn / bỏ chọn cả nhóm đang đứng |
-| `Enter` / `←` `→` | mở / đóng nhóm (`c` để mở / đóng tất cả) |
-| `s` | chọn các mục được gợi ý (`*`) |
-| `u` | bỏ chọn tất cả |
-| `d` | xoá các mục đã chọn (có hỏi xác nhận) |
-| `r` | quét lại |
-| `q` | thoát |
+| **`f`** | **quick clean**: select every suggested `*` item, then confirm deletion |
+| `↑` `↓` / `j` `k` | move (`PgUp` `PgDn`, `g` `G` to jump) |
+| `Space` | select / deselect; on a group header, the whole group |
+| `a` | select / deselect the whole group under the cursor |
+| `Enter` / `←` `→` | expand / collapse a group (`c` for all groups) |
+| `s` | select the suggested items (`*`) |
+| `u` | deselect everything |
+| `d` | delete the selected items (asks for confirmation) |
+| `r` | rescan |
+| `q` | quit |
 
-## Tool quét những gì
+## What it scans
 
-| Nhóm | Mục | Được gợi ý `*` khi |
+| Group | Items | Suggested `*` when |
 |---|---|---|
-| Xcode | `iOS DeviceSupport`, `DerivedData` | luôn gợi ý, Xcode tự tạo lại khi cần |
-| Xcode Archives | từng `.xcarchive`, kèm tên app, version và build | cũ hơn 60 ngày và không phải bản mới nhất của app đó |
-| Simulator | từng thiết bị | không khả dụng, hoặc không mở hơn 90 ngày |
-| Simulator runtime | từng runtime iOS / watchOS… | không còn simulator nào, hoặc không dùng hơn 90 ngày |
-| Android | `~/.gradle/caches`, `daemon`, từng bản wrapper, AVD emulator | `daemon` và các wrapper cũ (giữ bản mới nhất) |
-| Flutter / Dart | `~/.pub-cache`, các bản Flutter trong `~/fvm/versions` | không gợi ý, bạn tự quyết định |
-| Cache ứng dụng | `~/Library/Caches/*` (≥ 50 MB), cache npm | Homebrew, CocoaPods, Yarn, pip, npm… |
-| Thùng rác | `~/.Trash` | luôn gợi ý |
+| Xcode | `iOS DeviceSupport`, `DerivedData` | always, Xcode rebuilds them when needed |
+| Xcode Archives | each `.xcarchive`, with app name, version and build | older than 60 days and not the latest archive of that app |
+| Simulator | each device | unavailable, or not opened for 90+ days |
+| Simulator runtime | each iOS / watchOS… runtime | no simulators left, or not used for 90+ days |
+| Android | `~/.gradle/caches`, `daemon`, each wrapper version, AVD emulators | `daemon` and old wrappers (the newest is kept) |
+| Flutter / Dart | `~/.pub-cache`, Flutter versions in `~/fvm/versions` | never, you decide |
+| App caches | `~/Library/Caches/*` (≥ 50 MB), npm cache | Homebrew, CocoaPods, Yarn, pip, npm… |
+| Trash | `~/.Trash` | always |
 
-Dòng trên cùng còn cho biết tình trạng máy: dung lượng trống, swap, tình trạng pin và trạng thái SIP. Mục nào đáng lo sẽ được tô đỏ.
+The top bar also shows the machine's state: free disk space, swap, battery health and SIP status. Anything worth worrying about is shown in red.
 
-## An toàn
+## Safety
 
-- Luôn hỏi xác nhận trước khi xoá, và phải nhấn đúng `y` mới xoá.
-- Chỉ xoá đường dẫn **nằm trong thư mục home**.
-- Simulator và runtime được xoá bằng `xcrun simctl delete` / `xcrun simctl runtime delete`, không xoá file trực tiếp.
-- Tự tắt Gradle daemon trước khi xoá cache Gradle.
-- Xoá là **xoá hẳn**, không qua Thùng rác. Nếu không chắc, hãy chạy `--dry-run` trước.
+- It always asks before deleting, and only an exact `y` confirms.
+- It only deletes paths **inside your home folder**.
+- Simulators and runtimes are removed with `xcrun simctl delete` / `xcrun simctl runtime delete`, never by deleting files directly.
+- Gradle daemons are stopped before Gradle caches are deleted.
+- Deletion is **permanent**; nothing goes to the Trash. If in doubt, run with `--dry-run` first.
 
-> **Lưu ý:** Xoá Archive thì mất luôn dSYM của bản build đó, nên không thể symbolicate crash log của bản ấy nữa. Nếu bạn đã upload dSYM lên Crashlytics hoặc Sentry thì không sao.
+> **Note:** Deleting an archive also deletes its dSYMs, so crash logs from that build can no longer be symbolicated. This doesn't matter if you have already uploaded the dSYMs to Crashlytics or Sentry.
