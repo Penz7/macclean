@@ -23,6 +23,7 @@ import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -50,14 +51,18 @@ GROUPS = [
      "Xoá cache Gradle thì lần build đầu sau đó sẽ tải lại thư viện. Gợi ý: các bản wrapper cũ."),
     ("flutter", "Flutter / Dart",
      "pub-cache (flutter pub get sẽ tải lại) và các bản Flutter của fvm."),
+    ("ai", "AI agents · file tạm & lịch sử",
+     "Rác do Claude Code, Codex, Gemini/Antigravity… để lại. Gợi ý: lịch sử > 30 ngày, file tạm > 3 ngày, bản cập nhật cũ."),
+    ("ai_models", "AI · model & runtime đã tải",
+     "Model (HuggingFace, Whisper, Ollama…) và runtime — xoá được nhưng lần dùng sau phải tải lại rất lâu."),
     ("cache", "Cache ứng dụng",
      "~/Library/Caches (chỉ hiện mục ≥ 50M) và cache npm. Ứng dụng sẽ tự tạo lại."),
     ("trash", "Thùng rác", "Nội dung ~/.Trash."),
 ]
 GROUP_TITLE = {k: t for k, t, _ in GROUPS}
 GROUP_DESC = {k: d for k, _, d in GROUPS}
-MIN_SHOW = {"cache": 50 << 20, "trash": 1, "xcode": 1}
-SORT_BY_SIZE = {"xcode", "android", "flutter", "cache", "runtime"}
+MIN_SHOW = {"cache": 50 << 20, "trash": 1, "xcode": 1, "ai": 1 << 20, "ai_models": 1 << 20}
+SORT_BY_SIZE = {"xcode", "android", "flutter", "cache", "runtime", "ai", "ai_models"}
 SAFE_CACHES = {"Homebrew", "CocoaPods", "Yarn", "pip", "node-gyp", "pnpm", "go-build",
                "com.apple.dt.Xcode", "org.swift.swiftpm", "JetBrains", "Google"}
 
@@ -143,13 +148,21 @@ def fit(s, w, align="<"):
     return pad + "".join(out) if align == ">" else "".join(out) + pad
 
 
+def user_tmp():
+    r = run(["getconf", "DARWIN_USER_TEMP_DIR"])
+    return Path(r.stdout.strip() or os.environ.get("TMPDIR", "/tmp")).resolve()
+
+
+SAFE_ROOTS = [HOME.resolve(), user_tmp(), Path("/private/tmp")]
+
+
 def is_safe(p: Path):
-    """Chỉ cho xoá đường dẫn nằm bên trong thư mục home (không phải chính home)."""
+    """Chỉ cho xoá đường dẫn nằm bên trong home, $TMPDIR hoặc /tmp (không phải chính các thư mục đó)."""
     try:
         rp = p.parent.resolve() / p.name
     except OSError:
         return False
-    return rp != HOME and HOME in rp.parents
+    return any(rp != root and root in rp.parents for root in SAFE_ROOTS)
 
 
 # ───────────────────────────── dữ liệu ─────────────────────────────
@@ -324,7 +337,8 @@ def scan_caches():
         children = []
     for c in children:
         if c.is_dir() and not c.is_symlink():
-            items.append(Item("cache", c.name, str(c), detail=str(c), suggested=c.name in SAFE_CACHES))
+            items.append(Item("cache", c.name, str(c), detail=str(c),
+                              suggested=c.name in SAFE_CACHES or c.name.endswith(".ShipIt")))
     npm = HOME / ".npm/_cacache"
     if npm.is_dir():
         items.append(Item("cache", "npm cache", str(npm), detail=str(npm), suggested=True))
@@ -337,15 +351,156 @@ def scan_trash():
         if t.is_dir() else []
 
 
+def newest_mtime(p: Path):
+    """mtime mới nhất của p và các mục con trực tiếp (đủ để biết thư mục còn được dùng không)."""
+    try:
+        st = p.lstat()
+    except OSError:
+        return None
+    newest = st.st_mtime
+    if stat.S_ISDIR(st.st_mode):
+        try:
+            for c in os.scandir(p):
+                try:
+                    newest = max(newest, c.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return newest
+
+
+def old_children(dirs, days, skip=()):
+    """Các mục con (cấp 1) của dirs không thay đổi trong `days` ngày, thuộc user hiện tại."""
+    cutoff = time.time() - days * DAY
+    out = []
+    for d in dirs:
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if e.name.startswith(skip):
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+                continue
+            m = newest_mtime(Path(e.path))
+            if m is not None and m < cutoff:
+                out.append(e.path)
+    return out
+
+
+def old_files(root, days, suffix=""):
+    """Các file trong cây thư mục root (đệ quy) cũ hơn `days` ngày."""
+    cutoff = time.time() - days * DAY
+    out = []
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            if f.endswith(suffix):
+                p = os.path.join(dirpath, f)
+                try:
+                    if os.lstat(p).st_mtime < cutoff:
+                        out.append(p)
+                except OSError:
+                    pass
+    return out
+
+
+def paths_item(group, label, paths, detail, suggested=True, note=None):
+    """Gộp nhiều đường dẫn rời rạc thành một mục (vd: các phiên cũ hơn 30 ngày)."""
+    if not paths:
+        return []
+    return [Item(group, label, paths[0], kind="paths", detail=detail,
+                 note=note or f"{len(paths)} mục", suggested=suggested, extra={"paths": paths})]
+
+
+def scan_ai():
+    items = []
+    tmp = str(user_tmp())
+
+    # Claude Code
+    cl = HOME / ".claude"
+    items += paths_item("ai", "Claude Code · lịch sử phiên > 30 ngày",
+                        old_files(cl / "projects", 30, ".jsonl"), f"{cl}/projects/**/*.jsonl")
+    for sub in ("file-history", "shell-snapshots", "todos", "debug"):
+        items += paths_item("ai", f"Claude Code · {sub} > 30 ngày",
+                            old_children([cl / sub], 30), str(cl / sub))
+    items += paths_item("ai", "Claude Code · scratchpad /tmp > 3 ngày",
+                        old_children(sorted(Path("/private/tmp").glob(f"claude-{os.getuid()}")), 3),
+                        f"/private/tmp/claude-{os.getuid()}")
+
+    # Codex
+    cx = HOME / ".codex"
+    items += paths_item("ai", "Codex · lịch sử phiên > 30 ngày",
+                        old_files(cx / "sessions", 30), str(cx / "sessions"))
+    for pkg in sorted((cx / "packages").glob("*")):
+        cur = (pkg / "current").resolve().name if (pkg / "current").exists() else None
+        old = [str(r) for r in sorted((pkg / "releases").glob("*")) if r.is_dir() and r.name != cur]
+        items += paths_item("ai", f"Codex · bản cập nhật cũ ({pkg.name})", old,
+                            f"{pkg}/releases — giữ bản đang dùng {cur}", note=f"{len(old)} bản cũ")
+    rt = HOME / ".cache/codex-runtimes"
+    if rt.is_dir():
+        items.append(Item("ai_models", "Codex · runtime", str(rt), detail=f"{rt} — Codex tự tải lại"))
+
+    # Gemini CLI / Antigravity
+    g = HOME / ".gemini"
+    for base in ("antigravity-cli", "antigravity"):
+        items += paths_item("ai", f"{base} · hội thoại & brain > 30 ngày",
+                            old_children([g / base / "conversations", g / base / "brain"], 30),
+                            f"{g / base}/{{conversations,brain}}")
+    items += paths_item("ai", "Antigravity · quay màn hình trình duyệt > 30 ngày",
+                        old_children([g / "antigravity/browser_recordings"], 30),
+                        str(g / "antigravity/browser_recordings"))
+    items += paths_item("ai", "Gemini CLI · tmp", old_children([g / "tmp"], 0), str(g / "tmp"))
+
+    # workspaceStorage của các editor AI (VS Code fork)
+    for app in ("Antigravity", "Cursor", "Windsurf", "Code", "Kiro"):
+        ws = HOME / "Library/Application Support" / app / "User/workspaceStorage"
+        items += paths_item("ai", f"{app} · workspaceStorage > 30 ngày", old_children([ws], 30), str(ws))
+
+    # File tạm do agent / tool tạo ra
+    items += paths_item("ai", "File tạm $TMPDIR > 3 ngày",
+                        old_children([tmp], 3, skip=("com.apple.", ".")), tmp)
+    items += paths_item("ai", "File tạm /tmp > 3 ngày",
+                        old_children(["/private/tmp"], 3, skip=("com.apple.", ".", "claude-")),
+                        "/private/tmp (chỉ file của user hiện tại)")
+
+    # Model & cache lớn của AI — không gợi ý
+    for p, label in ((HOME / ".cache/huggingface", "HuggingFace models"),
+                     (HOME / ".cache/whisper", "Whisper models"),
+                     (HOME / ".cache/modelscope", "ModelScope models"),
+                     (HOME / ".ollama/models", "Ollama models"),
+                     (HOME / ".lmstudio/models", "LM Studio models"),
+                     (HOME / ".cache/uv", "uv cache (MCP chạy bằng uvx)")):
+        if p.is_dir():
+            items.append(Item("ai_models", label, str(p), detail=str(p)))
+    return items
+
+
 def scan_all():
     sims, runtimes = scan_simulators()
     return scan_xcode() + scan_archives() + sims + runtimes + scan_android() + \
-        scan_flutter() + scan_caches() + scan_trash()
+        scan_flutter() + scan_ai() + scan_caches() + scan_trash()
 
 
 def fill_size(it: Item):
-    if it.size is None:
+    if it.size is not None:
+        return
+    if it.kind != "paths":
         it.size = du_bytes(it.size_path or it.target)
+        return
+    total, paths = 0, it.extra["paths"]
+    for i in range(0, len(paths), 200):
+        r = run(["du", "-skc", *paths[i:i + 200]], timeout=900)
+        try:
+            total += int(r.stdout.strip().splitlines()[-1].split()[0]) * 1024
+        except (IndexError, ValueError):
+            pass
+    it.size = total
 
 
 def visible(it: Item):
@@ -404,10 +559,17 @@ def delete_item(it: Item):
         if it.kind == "runtime":
             r = run(["xcrun", "simctl", "runtime", "delete", it.target], timeout=600)
             return None if r.returncode == 0 else (r.stderr.strip() or "simctl runtime delete thất bại")
+        errs = []
+        if it.kind == "paths":
+            unsafe = [p for p in it.extra["paths"] if not is_safe(Path(p))]
+            if unsafe:
+                return f"đường dẫn không được phép xoá: {unsafe[0]}"
+            for p in it.extra["paths"]:
+                remove(Path(p), errs)
+            return f"{len(errs)} file không xoá được ({errs[0]})" if errs else None
         p = Path(it.target)
         if not is_safe(p):
             return "đường dẫn nằm ngoài thư mục home, bỏ qua"
-        errs = []
         if it.kind == "contents":
             for c in p.iterdir():
                 remove(c, errs)
@@ -479,7 +641,7 @@ class App:
         self.scanning = False
         self.spin = 0
         self.sys = SysInfo()
-        self.pool = ThreadPoolExecutor(max_workers=4)
+        self.pool = ThreadPoolExecutor(max_workers=8)
 
     # ── quét ──
     def start_scan(self):
@@ -797,7 +959,7 @@ class App:
 def scan_sized():
     print("Đang quét…", file=sys.stderr)
     items = scan_all()
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(fill_size, items))
     return items
 

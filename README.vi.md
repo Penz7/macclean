@@ -2,7 +2,7 @@
 
 **Tiếng Việt** · [English](README.md)
 
-Tool TUI chạy trong terminal để **kiểm tra và dọn dung lượng** trên máy Mac dùng để lập trình: Xcode, iOS Simulator, Gradle/Android, Flutter, cache ứng dụng.
+Tool TUI chạy trong terminal để **kiểm tra và dọn dung lượng** trên máy Mac dùng để lập trình: Xcode, iOS Simulator, Gradle/Android, Flutter, rác của AI agent, cache ứng dụng.
 
 ```
  macclean — dọn dẹp dung lượng Mac
@@ -89,7 +89,9 @@ Muốn xem trước những gì sẽ bị xoá thì chạy `macclean --quick --d
 | Simulator runtime | từng runtime iOS / watchOS… | không còn simulator nào, hoặc không dùng hơn 90 ngày |
 | Android | `~/.gradle/caches`, `daemon`, từng bản wrapper, AVD emulator | `daemon` và các wrapper cũ (giữ bản mới nhất) |
 | Flutter / Dart | `~/.pub-cache`, các bản Flutter trong `~/fvm/versions` | không gợi ý, bạn tự quyết định |
-| Cache ứng dụng | `~/Library/Caches/*` (≥ 50 MB), cache npm | Homebrew, CocoaPods, Yarn, pip, npm… |
+| AI agents | lịch sử phiên của Claude Code, Codex, Gemini CLI / Antigravity; bản Codex cũ sau khi tự cập nhật; video quay trình duyệt; `workspaceStorage` của các editor AI (Cursor, Windsurf, Antigravity, VS Code…); file tạm cũ trong `$TMPDIR` và `/tmp` | lịch sử cũ hơn 30 ngày, file tạm cũ hơn 3 ngày, bản cập nhật cũ (giữ bản đang dùng) |
+| AI model & runtime | HuggingFace, Whisper, ModelScope, Ollama, LM Studio, cache `uv`, runtime Codex | không gợi ý, vì tải lại rất lâu |
+| Cache ứng dụng | `~/Library/Caches/*` (≥ 50 MB), cache npm | Homebrew, CocoaPods, Yarn, pip, npm…, và bộ cài cập nhật còn sót (`*.ShipIt`) |
 | Thùng rác | `~/.Trash` | luôn gợi ý |
 
 Dòng trên cùng còn cho biết tình trạng máy: dung lượng trống, swap, tình trạng pin và trạng thái SIP. Mục nào đáng lo sẽ được tô đỏ.
@@ -97,7 +99,7 @@ Dòng trên cùng còn cho biết tình trạng máy: dung lượng trống, swa
 ## An toàn
 
 - Luôn hỏi xác nhận trước khi xoá, và phải nhấn đúng `y` mới xoá.
-- Chỉ xoá đường dẫn **nằm trong thư mục home**.
+- Chỉ xoá đường dẫn **nằm trong thư mục home, `$TMPDIR` hoặc `/tmp`**; trong các thư mục tạm thì chỉ xoá file thuộc về bạn.
 - Simulator và runtime được xoá bằng `xcrun simctl delete` / `xcrun simctl runtime delete`, không xoá file trực tiếp.
 - Tự tắt Gradle daemon trước khi xoá cache Gradle.
 - Xoá là **xoá hẳn**, không qua Thùng rác. Nếu không chắc, hãy chạy `--dry-run` trước.

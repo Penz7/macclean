@@ -2,7 +2,7 @@
 
 **English** · [Tiếng Việt](README.vi.md)
 
-A terminal TUI to **inspect and free up disk space** on a developer Mac: Xcode, iOS Simulator, Gradle/Android, Flutter and app caches.
+A terminal TUI to **inspect and free up disk space** on a developer Mac: Xcode, iOS Simulator, Gradle/Android, Flutter, AI agent leftovers and app caches.
 
 ```
  macclean — dọn dẹp dung lượng Mac
@@ -91,7 +91,9 @@ To see what would be deleted first, run `macclean --quick --dry-run`.
 | Simulator runtime | each iOS / watchOS… runtime | no simulators left, or not used for 90+ days |
 | Android | `~/.gradle/caches`, `daemon`, each wrapper version, AVD emulators | `daemon` and old wrappers (the newest is kept) |
 | Flutter / Dart | `~/.pub-cache`, Flutter versions in `~/fvm/versions` | never, you decide |
-| App caches | `~/Library/Caches/*` (≥ 50 MB), npm cache | Homebrew, CocoaPods, Yarn, pip, npm… |
+| AI agents | Claude Code, Codex, Gemini CLI / Antigravity session history; old Codex releases; browser recordings; `workspaceStorage` of AI editors (Cursor, Windsurf, Antigravity, VS Code…); stale files in `$TMPDIR` and `/tmp` | history older than 30 days, temp files older than 3 days, old self-update releases (the current one is kept) |
+| AI models & runtimes | HuggingFace, Whisper, ModelScope, Ollama, LM Studio, `uv` cache, Codex runtime | never, they take a long time to download again |
+| App caches | `~/Library/Caches/*` (≥ 50 MB), npm cache | Homebrew, CocoaPods, Yarn, pip, npm…, and app updater leftovers (`*.ShipIt`) |
 | Trash | `~/.Trash` | always |
 
 The top bar also shows the machine's state: free disk space, swap, battery health and SIP status. Anything worth worrying about is shown in red.
@@ -99,7 +101,7 @@ The top bar also shows the machine's state: free disk space, swap, battery healt
 ## Safety
 
 - It always asks before deleting, and only an exact `y` confirms.
-- It only deletes paths **inside your home folder**.
+- It only deletes paths **inside your home folder, `$TMPDIR` or `/tmp`**, and in the temp folders only files owned by you.
 - Simulators and runtimes are removed with `xcrun simctl delete` / `xcrun simctl runtime delete`, never by deleting files directly.
 - Gradle daemons are stopped before Gradle caches are deleted.
 - Deletion is **permanent**; nothing goes to the Trash. If in doubt, run with `--dry-run` first.
